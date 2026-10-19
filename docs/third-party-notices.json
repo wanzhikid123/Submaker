@@ -1,0 +1,533 @@
+[
+  {
+    "name": "altgraph",
+    "version": "0.17.5",
+    "license": "MIT",
+    "files": [
+      "docs\\licenses\\altgraph\\LICENSE"
+    ]
+  },
+  {
+    "name": "anyio",
+    "version": "4.15.1",
+    "license": "MIT",
+    "files": [
+      "docs\\licenses\\anyio\\LICENSE"
+    ]
+  },
+  {
+    "name": "av",
+    "version": "19.0.1",
+    "license": "BSD-3-Clause",
+    "files": [
+      "docs\\licenses\\av\\AUTHORS.py",
+      "docs\\licenses\\av\\AUTHORS.rst",
+      "docs\\licenses\\av\\LICENSE.txt",
+      "docs\\licenses\\av\\AUTHORS.cpython-312.pyc"
+    ]
+  },
+  {
+    "name": "certifi",
+    "version": "2026.10.18",
+    "license": "MPL-2.0",
+    "files": [
+      "docs\\licenses\\certifi\\LICENSE"
+    ]
+  },
+  {
+    "name": "click",
+    "version": "8.5.0",
+    "license": "BSD-3-Clause",
+    "files": [
+      "docs\\licenses\\click\\LICENSE.txt"
+    ]
+  },
+  {
+    "name": "colorama",
+    "version": "0.4.6",
+    "license": "See installed distribution notices",
+    "files": [
+      "docs\\licenses\\colorama\\LICENSE.txt"
+    ]
+  },
+  {
+    "name": "coloredlogs",
+    "version": "15.0.1",
+    "license": "MIT",
+    "files": [
+      "docs\\licenses\\coloredlogs\\LICENSE.txt"
+    ]
+  },
+  {
+    "name": "ctranslate2",
+    "version": "4.8.3",
+    "license": "MIT",
+    "files": []
+  },
+  {
+    "name": "faster-whisper",
+    "version": "1.2.1",
+    "license": "MIT",
+    "files": [
+      "docs\\licenses\\faster-whisper\\LICENSE"
+    ]
+  },
+  {
+    "name": "filelock",
+    "version": "4.2.2",
+    "license": "MIT",
+    "files": [
+      "docs\\licenses\\filelock\\LICENSE"
+    ]
+  },
+  {
+    "name": "flatbuffers",
+    "version": "25.12.19",
+    "license": "Apache 2.0",
+    "files": []
+  },
+  {
+    "name": "fsspec",
+    "version": "2026.9.0",
+    "license": "BSD-3-Clause",
+    "files": [
+      "docs\\licenses\\fsspec\\LICENSE"
+    ]
+  },
+  {
+    "name": "h11",
+    "version": "0.16.0",
+    "license": "MIT",
+    "files": [
+      "docs\\licenses\\h11\\LICENSE.txt"
+    ]
+  },
+  {
+    "name": "hf-xet",
+    "version": "1.7.0",
+    "license": "Apache-2.0",
+    "files": [
+      "docs\\licenses\\hf-xet\\LICENSE"
+    ]
+  },
+  {
+    "name": "httpcore",
+    "version": "1.0.9",
+    "license": "BSD-3-Clause",
+    "files": [
+      "docs\\licenses\\httpcore\\LICENSE.md"
+    ]
+  },
+  {
+    "name": "httpx",
+    "version": "0.28.1",
+    "license": "BSD-3-Clause",
+    "files": [
+      "docs\\licenses\\httpx\\LICENSE.md"
+    ]
+  },
+  {
+    "name": "huggingface_hub",
+    "version": "1.33.0",
+    "license": "Apache-2.0",
+    "files": [
+      "docs\\licenses\\huggingface_hub\\LICENSE"
+    ]
+  },
+  {
+    "name": "humanfriendly",
+    "version": "10.0",
+    "license": "MIT",
+    "files": [
+      "docs\\licenses\\humanfriendly\\LICENSE.txt"
+    ]
+  },
+  {
+    "name": "idna",
+    "version": "3.20",
+    "license": "BSD-3-Clause",
+    "files": [
+      "docs\\licenses\\idna\\LICENSE.md"
+    ]
+  },
+  {
+    "name": "iniconfig",
+    "version": "2.3.1",
+    "license": "MIT",
+    "files": [
+      "docs\\licenses\\iniconfig\\LICENSE"
+    ]
+  },
+  {
+    "name": "jaraco.classes",
+    "version": "3.4.0",
+    "license": "See installed distribution notices",
+    "files": [
+      "docs\\licenses\\jaraco.classes\\LICENSE"
+    ]
+  },
+  {
+    "name": "jaraco.context",
+    "version": "6.1.2",
+    "license": "MIT",
+    "files": [
+      "docs\\licenses\\jaraco.context\\LICENSE"
+    ]
+  },
+  {
+    "name": "jaraco.functools",
+    "version": "4.6.0",
+    "license": "MIT",
+    "files": [
+      "docs\\licenses\\jaraco.functools\\LICENSE"
+    ]
+  },
+  {
+    "name": "keyring",
+    "version": "25.7.0",
+    "license": "MIT",
+    "files": [
+      "docs\\licenses\\keyring\\LICENSE"
+    ]
+  },
+  {
+    "name": "more-itertools",
+    "version": "11.2.1",
+    "license": "MIT",
+    "files": [
+      "docs\\licenses\\more-itertools\\LICENSE"
+    ]
+  },
+  {
+    "name": "mpmath",
+    "version": "1.3.0",
+    "license": "BSD",
+    "files": [
+      "docs\\licenses\\mpmath\\LICENSE"
+    ]
+  },
+  {
+    "name": "numpy",
+    "version": "2.5.4",
+    "license": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
+    "files": [
+      "docs\\licenses\\numpy\\LICENSE.txt",
+      "docs\\licenses\\numpy\\1-LICENSE.txt",
+      "docs\\licenses\\numpy\\COPYING",
+      "docs\\licenses\\numpy\\LICENSE",
+      "docs\\licenses\\numpy\\dragon4_LICENSE.txt",
+      "docs\\licenses\\numpy\\LICENSE.md",
+      "docs\\licenses\\numpy\\6-LICENSE",
+      "docs\\licenses\\numpy\\7-LICENSE.md",
+      "docs\\licenses\\numpy\\8-LICENSE.txt",
+      "docs\\licenses\\numpy\\9-LICENSE",
+      "docs\\licenses\\numpy\\10-LICENSE.md",
+      "docs\\licenses\\numpy\\11-LICENSE.md",
+      "docs\\licenses\\numpy\\12-LICENSE.md",
+      "docs\\licenses\\numpy\\13-LICENSE.md",
+      "docs\\licenses\\numpy\\14-LICENSE.md",
+      "docs\\licenses\\numpy\\15-LICENSE.md",
+      "docs\\licenses\\numpy\\16-LICENSE.md",
+      "docs\\licenses\\numpy\\17-LICENSE.txt",
+      "docs\\licenses\\numpy\\18-LICENSE",
+      "docs\\licenses\\numpy\\19-LICENSE.md"
+    ]
+  },
+  {
+    "name": "nvidia-cublas-cu12",
+    "version": "12.8.4.1",
+    "license": "NVIDIA Proprietary Software",
+    "files": [
+      "docs\\licenses\\nvidia-cublas-cu12\\License.txt"
+    ]
+  },
+  {
+    "name": "nvidia-cuda-runtime-cu12",
+    "version": "12.8.90",
+    "license": "NVIDIA Proprietary Software",
+    "files": [
+      "docs\\licenses\\nvidia-cuda-runtime-cu12\\License.txt"
+    ]
+  },
+  {
+    "name": "nvidia-curand-cu12",
+    "version": "10.3.9.90",
+    "license": "NVIDIA Proprietary Software",
+    "files": [
+      "docs\\licenses\\nvidia-curand-cu12\\License.txt"
+    ]
+  },
+  {
+    "name": "onnxruntime",
+    "version": "1.31.0",
+    "license": "MIT License",
+    "files": [
+      "docs\\licenses\\onnxruntime\\LICENSE"
+    ]
+  },
+  {
+    "name": "packaging",
+    "version": "26.3",
+    "license": "Apache-2.0 OR BSD-2-Clause",
+    "files": [
+      "docs\\licenses\\packaging\\LICENSE",
+      "docs\\licenses\\packaging\\LICENSE.APACHE",
+      "docs\\licenses\\packaging\\LICENSE.BSD",
+      "docs\\licenses\\packaging\\__init__.py",
+      "docs\\licenses\\packaging\\_spdx.py"
+    ]
+  },
+  {
+    "name": "pefile",
+    "version": "2024.8.26",
+    "license": "MIT",
+    "files": [
+      "docs\\licenses\\pefile\\LICENSE"
+    ]
+  },
+  {
+    "name": "pip",
+    "version": "26.2.1",
+    "license": "MIT",
+    "files": [
+      "docs\\licenses\\pip\\AUTHORS.txt",
+      "docs\\licenses\\pip\\LICENSE.txt",
+      "docs\\licenses\\pip\\2-LICENSE.txt",
+      "docs\\licenses\\pip\\LICENSE",
+      "docs\\licenses\\pip\\4-LICENSE.txt",
+      "docs\\licenses\\pip\\5-LICENSE",
+      "docs\\licenses\\pip\\LICENSE.md",
+      "docs\\licenses\\pip\\COPYING",
+      "docs\\licenses\\pip\\8-LICENSE",
+      "docs\\licenses\\pip\\LICENSE.APACHE",
+      "docs\\licenses\\pip\\LICENSE.BSD",
+      "docs\\licenses\\pip\\11-LICENSE",
+      "docs\\licenses\\pip\\12-LICENSE",
+      "docs\\licenses\\pip\\13-LICENSE",
+      "docs\\licenses\\pip\\14-LICENSE",
+      "docs\\licenses\\pip\\15-LICENSE",
+      "docs\\licenses\\pip\\16-LICENSE",
+      "docs\\licenses\\pip\\17-LICENSE",
+      "docs\\licenses\\pip\\18-LICENSE",
+      "docs\\licenses\\pip\\19-LICENSE",
+      "docs\\licenses\\pip\\20-LICENSE",
+      "docs\\licenses\\pip\\21-LICENSE.txt",
+      "docs\\licenses\\pip\\22-LICENSE.txt",
+      "docs\\licenses\\pip\\LICENSE",
+      "docs\\licenses\\pip\\24-LICENSE.txt",
+      "docs\\licenses\\pip\\25-LICENSE",
+      "docs\\licenses\\pip\\LICENSE.md",
+      "docs\\licenses\\pip\\COPYING",
+      "docs\\licenses\\pip\\28-LICENSE",
+      "docs\\licenses\\pip\\LICENSE.APACHE",
+      "docs\\licenses\\pip\\LICENSE.BSD",
+      "docs\\licenses\\pip\\__init__.py",
+      "docs\\licenses\\pip\\_spdx.py",
+      "docs\\licenses\\pip\\33-LICENSE",
+      "docs\\licenses\\pip\\34-LICENSE",
+      "docs\\licenses\\pip\\35-LICENSE",
+      "docs\\licenses\\pip\\36-LICENSE",
+      "docs\\licenses\\pip\\37-LICENSE",
+      "docs\\licenses\\pip\\38-LICENSE",
+      "docs\\licenses\\pip\\39-LICENSE",
+      "docs\\licenses\\pip\\40-LICENSE",
+      "docs\\licenses\\pip\\41-LICENSE",
+      "docs\\licenses\\pip\\42-LICENSE",
+      "docs\\licenses\\pip\\43-LICENSE.txt"
+    ]
+  },
+  {
+    "name": "pluggy",
+    "version": "1.7.0",
+    "license": "MIT",
+    "files": [
+      "docs\\licenses\\pluggy\\LICENSE"
+    ]
+  },
+  {
+    "name": "protobuf",
+    "version": "7.36.2",
+    "license": "3-Clause BSD License",
+    "files": [
+      "docs\\licenses\\protobuf\\LICENSE"
+    ]
+  },
+  {
+    "name": "psutil",
+    "version": "7.2.2",
+    "license": "BSD-3-Clause",
+    "files": [
+      "docs\\licenses\\psutil\\LICENSE"
+    ]
+  },
+  {
+    "name": "Pygments",
+    "version": "2.21.0",
+    "license": "BSD-2-Clause",
+    "files": [
+      "docs\\licenses\\Pygments\\AUTHORS",
+      "docs\\licenses\\Pygments\\LICENSE"
+    ]
+  },
+  {
+    "name": "pyinstaller",
+    "version": "6.22.3",
+    "license": "GPLv2-or-later with a special exception which allows to use PyInstaller to build and distribute non-free programs (including commercial ones)",
+    "files": [
+      "docs\\licenses\\pyinstaller\\COPYING.txt"
+    ]
+  },
+  {
+    "name": "pyinstaller-hooks-contrib",
+    "version": "2026.8",
+    "license": "See installed distribution notices",
+    "files": [
+      "docs\\licenses\\pyinstaller-hooks-contrib\\LICENSE"
+    ]
+  },
+  {
+    "name": "pyreadline3",
+    "version": "3.5.6",
+    "license": "BSD",
+    "files": [
+      "docs\\licenses\\pyreadline3\\LICENSE.md"
+    ]
+  },
+  {
+    "name": "PySide6",
+    "version": "6.12.0",
+    "license": "LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only",
+    "files": [
+      "docs\\licenses\\PySide6\\LicenseRef-Qt-Commercial.txt"
+    ]
+  },
+  {
+    "name": "PySide6_Addons",
+    "version": "6.12.0",
+    "license": "LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only",
+    "files": [
+      "docs\\licenses\\PySide6_Addons\\LicenseRef-Qt-Commercial.txt"
+    ]
+  },
+  {
+    "name": "PySide6_Essentials",
+    "version": "6.12.0",
+    "license": "LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only",
+    "files": [
+      "docs\\licenses\\PySide6_Essentials\\LicenseRef-Qt-Commercial.txt"
+    ]
+  },
+  {
+    "name": "PySide6_Pdf",
+    "version": "6.12.0.140",
+    "license": "LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only",
+    "files": [
+      "docs\\licenses\\PySide6_Pdf\\LicenseRef-Qt-Commercial.txt"
+    ]
+  },
+  {
+    "name": "PySide6_WebEngine",
+    "version": "6.12.0.140",
+    "license": "LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only",
+    "files": [
+      "docs\\licenses\\PySide6_WebEngine\\LicenseRef-Qt-Commercial.txt"
+    ]
+  },
+  {
+    "name": "pytest",
+    "version": "9.1.1",
+    "license": "MIT",
+    "files": [
+      "docs\\licenses\\pytest\\LICENSE"
+    ]
+  },
+  {
+    "name": "pywin32-ctypes",
+    "version": "0.2.3",
+    "license": "BSD-3-Clause",
+    "files": [
+      "docs\\licenses\\pywin32-ctypes\\LICENSE.txt"
+    ]
+  },
+  {
+    "name": "PyYAML",
+    "version": "6.0.3",
+    "license": "MIT",
+    "files": [
+      "docs\\licenses\\PyYAML\\LICENSE"
+    ]
+  },
+  {
+    "name": "setuptools",
+    "version": "84.0.0",
+    "license": "MIT",
+    "files": [
+      "docs\\licenses\\setuptools\\LICENSE",
+      "docs\\licenses\\setuptools\\1-LICENSE",
+      "docs\\licenses\\setuptools\\2-LICENSE",
+      "docs\\licenses\\setuptools\\3-LICENSE",
+      "docs\\licenses\\setuptools\\4-LICENSE",
+      "docs\\licenses\\setuptools\\5-LICENSE",
+      "docs\\licenses\\setuptools\\6-LICENSE",
+      "docs\\licenses\\setuptools\\7-LICENSE",
+      "docs\\licenses\\setuptools\\LICENSE.APACHE",
+      "docs\\licenses\\setuptools\\LICENSE.BSD",
+      "docs\\licenses\\setuptools\\__init__.py",
+      "docs\\licenses\\setuptools\\_spdx.py",
+      "docs\\licenses\\setuptools\\12-LICENSE",
+      "docs\\licenses\\setuptools\\13-LICENSE",
+      "docs\\licenses\\setuptools\\LICENSE.txt",
+      "docs\\licenses\\setuptools\\15-LICENSE",
+      "docs\\licenses\\setuptools\\NOTICE",
+      "docs\\licenses\\setuptools\\17-NOTICE"
+    ]
+  },
+  {
+    "name": "shiboken6",
+    "version": "6.12.0",
+    "license": "LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only",
+    "files": [
+      "docs\\licenses\\shiboken6\\LicenseRef-Qt-Commercial.txt"
+    ]
+  },
+  {
+    "name": "sympy",
+    "version": "1.14.0",
+    "license": "BSD",
+    "files": [
+      "docs\\licenses\\sympy\\AUTHORS",
+      "docs\\licenses\\sympy\\LICENSE",
+      "docs\\licenses\\sympy\\LICENSE.txt"
+    ]
+  },
+  {
+    "name": "tokenizers",
+    "version": "0.23.3",
+    "license": "See installed distribution notices",
+    "files": []
+  },
+  {
+    "name": "tqdm",
+    "version": "4.70.1",
+    "license": "MPL-2.0 AND MIT",
+    "files": [
+      "docs\\licenses\\tqdm\\LICENCE"
+    ]
+  },
+  {
+    "name": "typing_extensions",
+    "version": "4.16.0",
+    "license": "PSF-2.0",
+    "files": [
+      "docs\\licenses\\typing_extensions\\LICENSE"
+    ]
+  },
+  {
+    "name": "wheel",
+    "version": "0.48.0",
+    "license": "MIT",
+    "files": [
+      "docs\\licenses\\wheel\\LICENSE.txt"
+    ]
+  }
+]
