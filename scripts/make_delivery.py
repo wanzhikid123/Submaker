@@ -10,7 +10,7 @@ delivery=root/"delivery"
 delivery.mkdir(exist_ok=True)
 archive=delivery/f"SubmakerStudio-v{__version__}-source-and-launcher.zip"
 files=[]
-public_docs={"validation.md", "performance.md", "third-party-notices.json", "workbench-light.png", "providers-light.png", "settings-light.png", "encoding-light.png"}
+public_docs={"validation.md", "performance.md", "h265-quality.md", "third-party-notices.json", "workbench-light.png", "providers-light.png", "settings-light.png", "encoding-light.png"}
 for name in ("submaker","scripts","tests","assets","docs","dist/SubmakerStudio"):
     for p in (root/name).rglob("*"):
         if not p.is_file() or "__pycache__" in p.parts or p.suffix == ".pyc":
