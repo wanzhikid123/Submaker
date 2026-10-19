@@ -73,6 +73,7 @@ class Settings:
     translate: Profile = dataclasses.field(default_factory=Profile)
     translators: list[Profile] = dataclasses.field(default_factory=list)
     review: Profile | None = None
+    repair_via_review: bool = True
 
     def translation_profiles(self):
         return [p for p in [self.translate, *self.translators] if p.enabled and p.url.strip() and p.model.strip()]
@@ -88,6 +89,11 @@ class Settings:
     def review_profile(self):
         return self.review or self.translate
 
+    def repair_settings(self):
+        if not self.repair_via_review:
+            return self
+        return dataclasses.replace(self, translate=dataclasses.replace(self.review_profile(), enabled=True), translators=[])
+
     def as_dict(self):
         return dataclasses.asdict(self)
 
@@ -98,12 +104,18 @@ class Settings:
             if d.get(k) is not None:
                 d[k] = Profile.from_dict(d[k])
         d["translators"] = [Profile.from_dict(p) for p in (d.get("translators") or [])]
+        # Existing task snapshots retain their original repair route and cache policy.
+        d.setdefault("repair_via_review", False)
         return cls(**d)
 
     @classmethod
     def load(cls):
         path = DATA / "settings.json"
-        return cls.from_dict(json.loads(path.read_text(encoding="utf-8"))) if path.exists() else cls()
+        if not path.exists():
+            return cls()
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value.setdefault("repair_via_review", True)
+        return cls.from_dict(value)
 
     def save(self):
         tmp = DATA / "settings.json.tmp"

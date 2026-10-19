@@ -98,7 +98,7 @@ def test_two_real_http_endpoints_run_at_combined_capacity_without_crossing_limit
             server.server_close()
 
 
-@pytest.mark.parametrize("kind", ["429", "quota", "401", "503", "timeout"])
+@pytest.mark.parametrize("kind", ["429", "quota", "401", "503", "timeout", "invalid_response"])
 def test_one_provider_failure_does_not_stop_other_provider_or_hide_its_warning(tmp_path, kind):
     settings = settings_pair()
     source = tmp_path/"source.mp4"
@@ -115,6 +115,8 @@ def test_one_provider_failure_does_not_stop_other_provider_or_hide_its_warning(t
         if body["model"] == "a":
             if kind == "timeout":
                 raise httpx.ReadTimeout("fixture")
+            if kind == "invalid_response":
+                return httpx.Response(200, content=b"invalid response envelope")
             return httpx.Response(int(kind) if kind.isdigit() else 429, headers={"Retry-After": "2"}, json={"error": {"code": "insufficient_quota" if kind == "quota" else "rate_limit"}})
         units = json.loads(body["messages"][1]["content"])["units"]
         return response({"translations": [{"id": r["id"], "text": "good"} for r in units]})
@@ -287,7 +289,8 @@ def test_recent_rate_limit_restores_only_its_provider_and_not_completed_history(
         store.close()
 
 
-def test_pipeline_keeps_completed_single_provider_units_when_pool_is_added(tmp_path, monkeypatch):
+@pytest.mark.parametrize("repair_via_review", [True, False])
+def test_pipeline_keeps_completed_single_provider_units_when_pool_is_added(tmp_path, monkeypatch, repair_via_review):
     import queue
     source = tmp_path/"source.mp4"
     source.write_bytes(b"fixture")
@@ -295,6 +298,8 @@ def test_pipeline_keeps_completed_single_provider_units_when_pool_is_added(tmp_p
     model.mkdir()
     (model/"model.bin").touch()
     settings = settings_pair()
+    settings.repair_via_review = repair_via_review
+    settings.review = Profile(name="Reviewer", url="http://localhost/review", model="review", effort="high", enabled=False, rpm=0, key_id="review-key")
     second = settings.translators.pop()
     settings.model_path, settings.output_dir = str(model), str(tmp_path/"out")
     video = {"index": 0, "codec_type": "video", "codec_name": "h264", "width": 1280, "height": 720, "pix_fmt": "yuv420p", "bit_rate": "1000000"}
@@ -317,15 +322,18 @@ def test_pipeline_keeps_completed_single_provider_units_when_pool_is_added(tmp_p
             self.reviews += 1
             if self.reviews == 1:
                 raise APIError("injected audit outage")
-            return []
+            return [{"ids": [args[1][0]["id"]], "severity": "error", "reason": "incorrect number"}]
         def title(self, *args): return "result"
     monkeypatch.setattr("submaker.pipeline.ASRPool", Pool)
     monkeypatch.setattr("submaker.pipeline.probe", lambda *args: info)
     monkeypatch.setattr("submaker.pipeline.burn", lambda src, dst, *args: dst.write_bytes(b"test output"))
-    client = TestClient(key_provider=lambda _: "")
+    client = TestClient(key_provider=lambda p: p.key_id)
     calls = []
-    def post(url, body, *args):
+    def post(url, body, headers, *args):
         calls.append(body["model"])
+        if body["model"] == "review":
+            assert url.endswith("/review/chat/completions")
+            assert body["reasoning_effort"] == "high" and headers["Authorization"] == "Bearer review-key"
         units = json.loads(body["messages"][1]["content"])["units"]
         return response({"translations": [{"id": r["id"], "text": "translated"} for r in units]})
     client._post = post
@@ -346,7 +354,8 @@ def test_pipeline_keeps_completed_single_provider_units_when_pool_is_added(tmp_p
         assert store.jobs()[0]["state"] == "完成", store.jobs()[0]["detail"]
         assert any(e["stage"] == "全片审校 0/1" for e in progress_events)
         assert any(e["stage"] == "全片审校 1/1" for e in progress_events)
-        assert calls == ["a"], "Adding capacity bought already translated units again"
+        assert len(calls) == 2 and calls[0] == "a", "Adding capacity bought already translated units again"
+        assert calls[-1] == "review" if repair_via_review else calls[-1] in ("a", "b")
         assert not store.db.execute("select 1 from checkpoints where job=?", (job,)).fetchone()
     finally:
         scheduler.shutdown()

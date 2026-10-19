@@ -97,6 +97,8 @@ def api_notice(row, now=None):
     limit, configured = row.get("api_effective_limit") or 0, row.get("api_configured_limit") or 0
     count = row.get("api_rate_limits") or 0
     parallel = f" · 实际并发上限 {limit}/{configured}" if configured else ""
+    if row.get("api_state") == "switching":
+        return "已尝试切换其他翻译接口 · " + (row.get("api_message") or "原接口暂不可用") + parallel
     if row.get("api_state") in ("paused", "quota") and row.get("api_message"):
         return row["api_message"] + parallel
     if row.get("state") == "等待处理" and "HTTP 429" in (row.get("detail") or ""):
@@ -152,9 +154,11 @@ def provider_detail_lines(row, activity=(), quotas=(), queued=0, now=None):
         limit = quota.get("effective_limit", record.get("effective_limit") or profile.concurrency)
         rpm = quota.get("rpm_limit", profile.rpm)
         used = quota.get("rpm_used", record.get("rpm_used", 0) if now-record.get("updated", 0) < 60 else None)
-        fault = quota.get("fault") or (record.get("message") if record.get("state") in ("paused", "quota", "timeout", "server_error") else "")
+        fault = quota.get("fault") or (record.get("message") if record.get("state") in ("paused", "quota", "timeout", "server_error", "switching") else "")
         if row.get("state", "").startswith("完成"):
             state = "已完成"
+        elif record.get("state") == "switching":
+            state = "已切换其他接口"
         elif fault:
             state = "内容拦截" if "内容策略拦截" in fault else "拒绝请求" if "模型拒绝" in fault else "额度不足" if "额度不足" in fault else "接口异常"
         elif retry:

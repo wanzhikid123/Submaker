@@ -435,7 +435,7 @@ class SettingsDialog(QDialog):
         tabs.addTab(self.pool, "翻译接口池")
         review_page = QWidget()
         review_layout = QVBoxLayout(review_page)
-        review_note = label("全片上下文、审校和文件名翻译统一使用此接口。字幕修正由已启用的翻译接口池完成。", "muted")
+        review_note = label("新任务的全片上下文、审校、自动修正和文件名翻译统一使用此接口及模型。已有任务保留其保存的修正方式。", "muted")
         review_note.setWordWrap(True)
         review_layout.addWidget(review_note)
         review_scroll = QScrollArea()
@@ -1026,6 +1026,8 @@ class MainWindow(QMainWindow):
                 if notice:
                     notices.append((name+"：" if name else "")+notice)
                 limited = status_row.get("api_state") in ("paused", "quota", "timeout", "server_error") or (status_row.get("api_retry_at") or 0) > time.time()
+                if status_row.get("api_state") == "switching":
+                    limited = False
                 if limited and notice and not row["state"].startswith("完成"):
                     repeated = row["state"] == "等待处理" and status_row.get("api_message") and status_row["api_message"] in row["detail"]
                     if not repeated:

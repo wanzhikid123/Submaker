@@ -132,7 +132,11 @@ class Scheduler:
                 return
         if settings is not None:
             with self.store.lock, self.store.db:
-                self.store.db.execute("UPDATE jobs SET config=? WHERE id=?", (json.dumps(settings.as_dict(), ensure_ascii=False), ident))
+                saved = self.store.db.execute("SELECT config FROM jobs WHERE id=?", (ident,)).fetchone()
+                value = settings.as_dict()
+                if saved:
+                    value["repair_via_review"] = Settings.from_dict(json.loads(saved[0])).repair_via_review
+                self.store.db.execute("UPDATE jobs SET config=? WHERE id=?", (json.dumps(value, ensure_ascii=False), ident))
         if title:
             self.store.put(ident, "manual_title", legal_stem(title))
         if hasattr(self.client, "reset_faults"):
@@ -504,6 +508,7 @@ class Scheduler:
                 self.store.put(ident, state_key, audit_state)
                 affected = {j for x in issues for j in x["ids"]}
                 repaired = set(audit_state["repaired"])
+                repair_settings = settings.repair_settings()
                 repair_batches = list(split_rows([s for s in segments if s["id"] in affected-repaired], max_count=8))
                 for i, batch in enumerate(repair_batches):
                     batch_ids = {s["id"] for s in batch}
@@ -513,7 +518,7 @@ class Scheduler:
                     end = min(len(segments), segments.index(batch[-1])+5)
                     context = {"global_brief": brief, "neighbors": [{"source": s["text"], "translation": translations.get(s["id"], "")} for s in segments[begin:end]]}
                     repair_rows = [{"id": s["id"], "text": s["text"]} for s in batch]
-                    fixed = audit_call("repair-once", {"translation_policy": translation_key(settings, [], None), "source": settings.source, "prompt": settings.prompt, "rows": repair_rows, "context": context, "instruction": instruction}, lambda: self.client.translate(settings, repair_rows, context, cancel, instruction))
+                    fixed = audit_call("repair-once", {"translation_policy": translation_key(repair_settings, [], None), "source": settings.source, "prompt": settings.prompt, "rows": repair_rows, "context": context, "instruction": instruction}, lambda: self.client.translate(repair_settings, repair_rows, context, cancel, instruction))
                     translations.update(fixed)
                     repaired.update(batch_ids)
                     audit_state.update(translations=translations, repaired=sorted(repaired))

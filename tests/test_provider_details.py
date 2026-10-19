@@ -139,3 +139,31 @@ def test_review_count_and_terminal_failure_are_visible_without_other_provider_er
     finally:
         window.close()
         window.store.close()
+
+
+def test_pool_switching_retains_details_and_429_counts_but_only_final_failure_raises_banner(tmp_path, monkeypatch):
+    settings, _ = settings_and_row()
+    monkeypatch.setattr(Settings, "load", classmethod(lambda cls: settings))
+    monkeypatch.setattr("submaker.gui.Store", lambda: Store(tmp_path/"jobs.sqlite"))
+    window = MainWindow()
+    try:
+        source = tmp_path/"fixture.mp4"
+        source.write_bytes(b"fixture")
+        job = window.store.add(source, settings)
+        window.media_info[job] = {"error": "fixture"}
+        window.store.update(job, "处理中", "即时翻译")
+        profile = settings.translators[0]
+        window.store.record_api(job, {"event": "rate_limit", "profile_id": profile_tag(profile), "profile_name": profile.name,
+                                     "pool_failover": True, "code": 429, "message": "HTTP 429：接口限流", "retry_at": time.time()+60})
+        window.refresh()
+        assert window.api_banner.isHidden()
+        text = window.queue.item(0, 5).text()
+        assert "Gemini：已切换其他接口" in text and "HTTP 429" in text and "429 1次" in text
+        error = "所有启用的翻译接口均不可用：ChatGPT；Gemini；OpenRouter"
+        window.store.update(job, "等待处理", error)
+        window.on_event("error", {"job": job, "error": error})
+        assert not window.api_banner.isHidden()
+        assert all(p.name in window.api_banner.text() for p in settings.translation_profiles())
+    finally:
+        window.close()
+        window.store.close()

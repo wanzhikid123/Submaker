@@ -317,9 +317,9 @@ class Client:
             rows.append({"name": profile.name, "profile": profile_tag(profile), "fault": fault, **snapshot})
         return rows
 
-    def _notify(self, profile, gate, event, code=0, message="", attempt=0):
+    def _notify(self, profile, gate, event, code=0, message="", attempt=0, pool_failover=False):
         state = gate.snapshot()
-        self.status({"job": JOB_CONTEXT.get(), "profile_id": profile_tag(profile), "profile_name": profile.name, "event": event, "code": code, "message": message, "attempt": attempt, "configured_limit": profile.concurrency, **state, "retry_at": time.time()+state["retry_seconds"] if state["retry_seconds"] else 0, "rpm_ready_at": time.time()+state["rpm_wait_seconds"] if state["rpm_wait_seconds"] else 0})
+        self.status({"job": JOB_CONTEXT.get(), "profile_id": profile_tag(profile), "profile_name": profile.name, "event": event, "code": code, "message": message, "attempt": attempt, "pool_failover": pool_failover, "configured_limit": profile.concurrency, **state, "retry_at": time.time()+state["retry_seconds"] if state["retry_seconds"] else 0, "rpm_ready_at": time.time()+state["rpm_wait_seconds"] if state["rpm_wait_seconds"] else 0})
 
     def reset_faults(self):
         with self.fault_lock:
@@ -376,27 +376,33 @@ class Client:
             with self.fault_lock:
                 return self.faults.get(fault_keys[id(p)])
         activity_id = threading.get_ident()
-        last_error = ""
+        failures = []
+        remaining = list(gates)
         try:
-            for _ in range(max(3, len(candidates))):
+            while remaining:
                 with self.activity_lock:
-                    self.activity[activity_id] = {"job": JOB_CONTEXT.get(), "kind": "翻译", "model": "多接口调度", "profile_name": "翻译池", "started": time.monotonic(), "phase": "queued", "configured_limit": sum(p.concurrency for p in candidates), "last_error": last_error, "_gates": list({id(g): g for _, g in gates}.values())}
+                    self.activity[activity_id] = {"job": JOB_CONTEXT.get(), "kind": "翻译", "model": "多接口调度", "profile_name": "翻译池", "started": time.monotonic(), "phase": "queued", "configured_limit": sum(p.concurrency for p in candidates), "last_error": "；".join(failures), "_gates": list({id(g): g for _, g in remaining}.values())}
                 if reservation:
                     selected, gate = reservation.profile, reservation.gate
                 else:
-                    selected, gate = self.limits.acquire_any(gates, fault, cancel)
+                    try:
+                        selected, gate = self.limits.acquire_any(remaining, fault, cancel)
+                    except APIError:
+                        failures.extend(f"{p.name}：{fault(p)}" for p, _ in remaining if fault(p))
+                        break
                     reservation = Reservation(selected, gate)
+                remaining = [(p, g) for p, g in remaining if profile_tag(p) != profile_tag(selected)]
                 try:
                     result = self._request_single(selected, system, payload, cancel, budget, validator, reservation, True)
                     if trace is not None:
                         trace["profile"] = profile_identity(selected)
                     return result
                 except APIFailover as exc:
-                    last_error = str(exc)
+                    failures.append(f"{selected.name}：{exc}")
                 finally:
                     reservation.close()
                     reservation = None
-            raise APIError("翻译池暂不可用；已保留恢复点：" + last_error)
+            raise APIError("所有启用的翻译接口均不可用；已保留恢复点：" + "；".join(failures))
         finally:
             with self.activity_lock:
                 self.activity.pop(activity_id, None)
@@ -428,7 +434,7 @@ class Client:
             last_response_error = ""
             for attempt in range(3):
                 check(cancel)
-                kind = "翻译" if system.startswith("Translate subtitles") else "审校" if system.startswith("Audit every") else "上下文整理" if system.startswith("Create a concise") else "标题" if system.startswith("Translate only") else "接口测试"
+                kind = ("自动修正" if payload.get("repair_instruction") else "翻译") if system.startswith("Translate subtitles") else "审校" if system.startswith("Audit every") else "上下文整理" if system.startswith("Create a concise") else "标题" if system.startswith("Translate only") else "接口测试"
                 with self.activity_lock:
                     self.activity[activity_id] = {"job": JOB_CONTEXT.get(), "kind": kind, "model": profile.model, "profile_name": profile.name, "profile_id": profile_tag(profile), "attempt": attempt+1, "started": time.monotonic(), "timeout": profile.timeout, "last_error": last_response_error, "phase": "queued", "configured_limit": profile.concurrency, "_gate": semaphore}
                 self._notify(profile, semaphore, "queued", attempt=attempt+1)
@@ -439,7 +445,7 @@ class Client:
                 slot_held = True
                 with self.fault_lock:
                     if fault_key in self.faults:
-                        self._notify(profile, semaphore, "paused", message=self.faults[fault_key])
+                        self._notify(profile, semaphore, "paused", message=self.faults[fault_key], pool_failover=failover)
                         raise (APIFailover(self.faults[fault_key]) if failover else APIError(self.faults[fault_key]))
                 with self.activity_lock:
                     self.activity[activity_id].update(phase="request", started=time.monotonic())
@@ -464,7 +470,7 @@ class Client:
                         if quota:
                             with self.fault_lock:
                                 self.faults[fault_key] = message
-                        self._notify(profile, semaphore, "quota" if quota else "rate_limit", 429, message, attempt+1)
+                        self._notify(profile, semaphore, "quota" if quota else "rate_limit", 429, message, attempt+1, pool_failover=failover)
                         if failover:
                             raise APIFailover(message)
                         if quota or attempt == 2:
@@ -473,7 +479,7 @@ class Client:
                         last_response_error = message
                         continue
                     if response.status_code in (500, 502, 503, 504):
-                        self._notify(profile, semaphore, "server_error", response.status_code, f"服务端暂时不可用 HTTP {response.status_code}", attempt+1)
+                        self._notify(profile, semaphore, "server_error", response.status_code, f"服务端暂时不可用 HTTP {response.status_code}", attempt+1, pool_failover=failover)
                         if failover:
                             raise APIFailover(f"服务端暂时不可用 HTTP {response.status_code}")
                         if attempt == 2:
@@ -487,6 +493,15 @@ class Client:
                             time.sleep(delay)
                         continue
                     if response.status_code != 200:
+                        if response.status_code in (400, 403):
+                            try:
+                                reason = response.json().get("error", {}).get("code", "")
+                            except (ValueError, AttributeError):
+                                reason = ""
+                            if isinstance(reason, str) and reason.lower() in ("content_filter", "content_policy_violation", "prohibited_content", "safety", "prompt_blocked"):
+                                message = generation_stop_message("content_filter: " + reason)
+                                self._notify(profile, semaphore, "paused", response.status_code, message, attempt+1)
+                                raise APIError(f"{profile.name} · {kind}：{message}")
                         if response.status_code == 400:
                             try:
                                 error = response.json().get("error", {})
@@ -497,7 +512,7 @@ class Client:
                         # Avoid exposing keys / gateway echoed request bodies in logs.
                         hint = "；所选 effort 或 JSON 模式可能不受支持，请调整后重试" if response.status_code in (400, 422) else ""
                         message = f"接口返回 HTTP {response.status_code}{hint}（未改动此接口配置）"
-                        self._notify(profile, semaphore, "paused", response.status_code, message, attempt+1)
+                        self._notify(profile, semaphore, "paused", response.status_code, message, attempt+1, pool_failover=failover)
                         if response.status_code in (400, 401, 402, 403, 404, 422):
                             with self.fault_lock:
                                 self.faults[fault_key] = message + "；已暂停该配置，修改设置并重试可解除"
@@ -531,7 +546,7 @@ class Client:
                     self._notify(profile, semaphore, "success", 200, attempt=attempt+1)
                     return parsed
                 except (httpx.TimeoutException, httpx.TransportError) as exc:
-                    self._notify(profile, semaphore, "timeout", 0, "请求超时或连接中断；这不等于HTTP 429限流", attempt+1)
+                    self._notify(profile, semaphore, "timeout", 0, "请求超时或连接中断；这不等于HTTP 429限流", attempt+1, pool_failover=failover)
                     if failover:
                         raise APIFailover("请求超时或连接中断") from exc
                     if attempt == 2:
@@ -544,6 +559,9 @@ class Client:
                     # Never treat malformed output as an empty audit. Ask for a corrected
                     # complete reply, using the same model, effort and supplied content.
                     last_response_error = str(exc) if isinstance(exc, APIResponseInvalid) else "模型返回的数据结构或 JSON 无效"
+                    if failover:
+                        self._notify(profile, semaphore, "paused", 200, last_response_error, attempt+1, pool_failover=True)
+                        raise APIFailover(last_response_error) from exc
                     if attempt == 2:
                         message = last_response_error + "（最多3次请求后仍未通过格式校验）；已保留恢复点"
                         self._notify(profile, semaphore, "paused", 200, message, attempt+1)
