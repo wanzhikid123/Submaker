@@ -141,11 +141,12 @@ class Limits:
     def for_profile(self, p):
         # Same endpoint and credential identity share one pool across all stages.
         key = (endpoint(p), p.key_id)
+        limit = 1 if p.provider == "local" else max(1, p.concurrency)
         with self.lock:
             if key not in self.slots:
-                self.slots[key] = Gate(max(1, p.concurrency), p.rpm)
+                self.slots[key] = Gate(limit, p.rpm)
             else:
-                self.slots[key].lower_to(max(1, p.concurrency), p.rpm)
+                self.slots[key].lower_to(limit, p.rpm)
             return self.slots[key]
 
     def peek(self, profile):
@@ -154,6 +155,16 @@ class Limits:
         url = base if base.endswith("/chat/completions") else base+"/chat/completions"
         with self.lock:
             return self.slots.get((url, profile.key_id))
+
+    def discard(self, profile):
+        key = (endpoint(profile), profile.key_id)
+        with self.lock:
+            gate = self.slots.get(key)
+            if gate:
+                state = gate.snapshot()
+                if state["active"] or state["waiting"]:
+                    raise APIError("本地请求尚未停止，请等待后再修改并发")
+                self.slots.pop(key, None)
 
     def acquire_any(self, candidates, fault, cancel=None, wait=True):
         # Select only a ready endpoint. Waiting for one provider must not reserve
@@ -277,7 +288,7 @@ class Gate:
 
 
 class Client:
-    def __init__(self, limits=None, usage=None, key_provider=get_key, status=None):
+    def __init__(self, limits=None, usage=None, key_provider=get_key, status=None, local_only=False, local_runtime=None):
         self.limits = limits or Limits()
         self.usage = usage or (lambda _: None)
         self.key_provider = key_provider
@@ -286,6 +297,14 @@ class Client:
         self.fault_lock = threading.Lock()
         self.activity = {}
         self.activity_lock = threading.Lock()
+        self.local_only = local_only
+        self.local_runtime = local_runtime
+
+    def runtime(self):
+        if self.local_runtime is None:
+            from .local_llm import get_runtime
+            self.local_runtime = get_runtime()
+        return self.local_runtime
 
     def activity_snapshot(self):
         with self.activity_lock:
@@ -348,6 +367,8 @@ class Client:
         return asyncio.run(send())
 
     def translation_reserver(self, settings):
+        if self.local_only and any(p.provider != "local" for p in settings.translation_profiles()):
+            raise APIError("本地模型模式已禁用网络 API；请使用当前设置重试此任务")
         candidates = [(p, self.limits.for_profile(p)) for p in settings.translation_profiles()]
         fault_keys = {id(p): (endpoint(p), p.model, p.effort, p.key_id) for p, _ in candidates}
         def fault(profile):
@@ -360,6 +381,10 @@ class Client:
 
     def request(self, profile, system, payload, cancel=None, budget=None, validator=None, profiles=None, trace=None, reservation=None):
         candidates = profiles or [profile]
+        if self.local_only and any(p.provider != "local" for p in candidates):
+            if reservation:
+                reservation.close()
+            raise APIError("本地模型模式已禁用网络 API；请使用当前设置重试此任务")
         if len(candidates) == 1:
             selected = candidates[0]
             try:
@@ -422,7 +447,7 @@ class Client:
             with self.fault_lock:
                 if fault_key in self.faults:
                     raise (APIFailover(self.faults[fault_key]) if failover else APIError(self.faults[fault_key]))
-            key = self.key_provider(profile)
+            key = "" if profile.provider == "local" else self.key_provider(profile)
             headers = {"Authorization": "Bearer " + key} if key else {}
             if profile.provider == "google":
                 headers["x-goog-api-client"] = f"submaker-studio-oai/{__version__}"
@@ -431,6 +456,11 @@ class Client:
                 body["reasoning_effort"] = profile.effort
             if profile.json_mode:
                 body["response_format"] = {"type": "json_object"}
+            if profile.provider == "local":
+                if profile.local_model is None:
+                    raise APIError("本地模型配置缺失；未调用网络 API")
+                body.update(max_tokens=profile.max_tokens, temperature=.2,
+                            chat_template_kwargs={"enable_thinking": profile.effort != "none"})
             last_response_error = ""
             for attempt in range(3):
                 check(cancel)
@@ -455,6 +485,20 @@ class Client:
                     budget[0] += 1
                 try:
                     check(cancel)
+                    if profile.provider == "local":
+                        with self.activity_lock:
+                            self.activity[activity_id].update(phase="loading")
+                        try:
+                            local_url, local_key = self.runtime().ensure(profile.local_model, cancel)
+                        except Cancelled:
+                            raise
+                        except RuntimeError as exc:
+                            self._notify(profile, semaphore, "paused", message=str(exc), attempt=attempt+1)
+                            raise APIError(str(exc)) from exc
+                        url = local_url
+                        headers = {"Authorization": "Bearer "+local_key}
+                        with self.activity_lock:
+                            self.activity[activity_id].update(phase="request", started=time.monotonic())
                     self._notify(profile, semaphore, "request", attempt=attempt+1)
                     # No redirects; no unrelated proxy credentials or ambient auth.
                     response = self._post(url, body, headers, profile.timeout, cancel)
@@ -505,7 +549,7 @@ class Client:
                         if response.status_code == 400:
                             try:
                                 error = response.json().get("error", {})
-                                if error.get("code") == "context_length_exceeded":
+                                if error.get("code") == "context_length_exceeded" or profile.provider == "local" and error.get("type") == "exceed_context_size_error":
                                     raise APITruncated("模型上下文不足")
                             except (ValueError, AttributeError):
                                 pass
@@ -614,18 +658,40 @@ class Client:
                 return run(batch[:half]) | run(batch[half:])
         return TranslationResult(run(rows), providers)
 
-    def review(self, settings, rows, brief, cancel=None):
-        profile = settings.review or settings.translate
+    def review(self, settings, rows, brief, cancel=None, _local_budget=None):
+        profile = settings.review_profile()
+        local_budget = _local_budget if _local_budget is not None else [0]
+        if profile.provider == "local":
+            local_budget[0] += 1
+            if local_budget[0] > 15:
+                raise APIError("本地审校拆批仍超过模型容量，请增大上下文或输出 tokens 上限；已保留恢复点")
         # Short request-local IDs are easier for models to copy than opaque hashes.
         # Only strictly validated IDs are mapped back to the saved subtitle records.
         aliases = {f"s{i+1:04}": r["id"] for i, r in enumerate(rows)}
         units = [{**row, "id": alias} for alias, row in zip(aliases, rows)]
         known = set(aliases)
-        result = self.request(profile, "Audit every provided source/translation pair against its context and global brief. Find meaning errors, omissions, wrong numbers/names, inconsistent terms and broken cross-chunk sentences. Avoid stylistic rewrites without a real problem. Output {\"issues\":[{\"ids\":[\"exact unit id such as s0001\"],\"reason\":\"specific problem\",\"severity\":\"error or warning\"}]}; no issues => {\"issues\":[]}. ids must be arrays and may contain only exact IDs from units; never use row numbers or ranges.", {"target_language": settings.target, "global_brief": brief, "glossary": settings.glossary, "units": units}, cancel, validator=lambda value: validate_review(value, known))
+        try:
+            result = self.request(profile, "Audit every provided source/translation pair against its context and global brief. Find meaning errors, omissions, wrong numbers/names, inconsistent terms and broken cross-chunk sentences. Avoid stylistic rewrites without a real problem. Output {\"issues\":[{\"ids\":[\"exact unit id such as s0001\"],\"reason\":\"specific problem\",\"severity\":\"error or warning\"}]}; no issues => {\"issues\":[]}. ids must be arrays and may contain only exact IDs from units; never use row numbers or ranges.", {"target_language": settings.target, "global_brief": brief, "glossary": settings.glossary, "units": units}, cancel, validator=lambda value: validate_review(value, known))
+        except APITruncated:
+            if profile.provider != "local" or len(rows) < 2:
+                raise
+            half = len(rows)//2
+            return self.review(settings, rows[:half], brief, cancel, local_budget) + self.review(settings, rows[half:], brief, cancel, local_budget)
         return [{**issue, "ids": [aliases[i] for i in issue["ids"]]} for issue in validate_review(result, known)]
 
-    def brief(self, settings, rows, cancel=None):
-        result = self.request(settings.review or settings.translate, "Create a concise factual subtitle continuity brief: named characters, relationships, recurring terminology and events, based only on the provided subtitles. Preserve uncertainty. Output {\"brief\":\"text\"}.", {"target_language": settings.target, "content": rows}, cancel, validator=lambda value: validate_text(value, "brief"))
+    def brief(self, settings, rows, cancel=None, _local_budget=None):
+        local_budget = _local_budget if _local_budget is not None else [0]
+        if settings.llm_mode == "local":
+            local_budget[0] += 1
+            if local_budget[0] > 15:
+                raise APIError("本地上下文整理超过拆批预算，请增加模型上下文长度；已保留恢复点")
+        try:
+            result = self.request(settings.review_profile(), "Create a concise factual subtitle continuity brief: named characters, relationships, recurring terminology and events, based only on the provided subtitles. Preserve uncertainty. Output {\"brief\":\"text\"}.", {"target_language": settings.target, "content": rows}, cancel, validator=lambda value: validate_text(value, "brief"))
+        except APITruncated:
+            if settings.llm_mode != "local" or len(rows) < 2:
+                raise
+            half = len(rows)//2
+            return self.brief(settings, rows[:half], cancel, local_budget) + "\n" + self.brief(settings, rows[half:], cancel, local_budget)
         validate_text(result, "brief")
         return result["brief"][:10000]
 
@@ -652,11 +718,17 @@ def translation_unit_keys(settings, row):
 
 
 def profile_identity(profile):
-    return {"url": endpoint(profile) if profile.url else "", "model": profile.model, "effort": profile.effort, "json_mode": profile.json_mode, "key_id": profile.key_id}
+    result = {"url": endpoint(profile) if profile.url else "", "model": profile.model, "effort": profile.effort, "json_mode": profile.json_mode, "key_id": profile.key_id}
+    if profile.provider == "local" and profile.local_model:
+        from .local_llm import model_identity
+        result.update(local_model=model_identity(profile.local_model), context=profile.local_model.context, max_tokens=profile.max_tokens)
+    return result
 
 
 def profile_tag(profile):
     base = profile.url.strip().rstrip("/")
     url = base if base.endswith("/chat/completions") else base+"/chat/completions"
     identity = (url, profile.key_id, profile.model, profile.effort)
+    if profile.provider == "local":
+        identity += (json.dumps(profile_identity(profile), sort_keys=True), profile.name)
     return hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:16]

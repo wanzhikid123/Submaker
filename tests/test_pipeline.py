@@ -13,7 +13,7 @@ from submaker.store import Store, fingerprint
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="FFmpeg not available")
-@pytest.mark.parametrize("failure", ["none", "title", "translate", "repair", "review_batch"])
+@pytest.mark.parametrize("failure", ["none", "title", "translate", "repair", "review_batch", "segment", "segment_fallback"])
 def test_streaming_translation_review_repair_and_real_burn(tmp_path, monkeypatch, failure):
     source = tmp_path / "original.mp4"
     subprocess.run(["ffmpeg","-v","error","-f","lavfi","-i","color=c=navy:s=640x360:r=25:d=3","-f","lavfi","-i","sine=frequency=400:duration=3","-c:v","libx264","-c:a","aac","-shortest",str(source)],check=True)
@@ -76,6 +76,17 @@ def test_streaming_translation_review_repair_and_real_burn(tmp_path, monkeypatch
     model.mkdir()
     (model / "model.bin").touch()
     settings = Settings(model_path=str(model), output_dir=str(tmp_path/"out"), gpus=[0], encoding="quality", decoding="software")
+    if failure.startswith("segment"):
+        if not shutil.which("nvidia-smi"):
+            pytest.skip("GPU export required")
+        settings.encoding = "hardware"
+        monkeypatch.setattr("submaker.segmented.enabled", lambda *args: True)
+        if failure == "segment_fallback":
+            from submaker.segmented import TimelineError
+            def fallback(*args, **kwargs):
+                sequence.append("segment_fallback")
+                raise TimelineError("injected unsupported timeline")
+            monkeypatch.setattr("submaker.segmented.burn_segmented", fallback)
     settings.translate.url, settings.translate.model = "http://127.0.0.1/v1", "mock"
     store = Store(tmp_path/"jobs.sqlite")
     ident = store.add(source,settings)
@@ -84,7 +95,7 @@ def test_streaming_translation_review_repair_and_real_burn(tmp_path, monkeypatch
     deadline = time.monotonic()+40
     while scheduler.active and time.monotonic()<deadline:
         time.sleep(0.1)
-    if failure != "none":
+    if failure not in ("none", "segment", "segment_fallback"):
         assert store.jobs()[0]["state"] == "等待处理"
         assert store.get(ident,"chunk:0") is not None  # Translation outage must not abort local ASR.
         translations_before = sequence.count("translate") + sequence.count("repair")
@@ -102,6 +113,8 @@ def test_streaming_translation_review_repair_and_real_burn(tmp_path, monkeypatch
             assert sequence.count("review") == reviews_before + 1, "Previously completed audit batch was sent again"
     row = store.jobs()[0]
     assert row["state"] == "完成", row["detail"]
+    if failure == "segment_fallback":
+        assert sequence.count("segment_fallback") == 1
     assert Path(row["output"]).exists()
     assert not list((tmp_path/"out").rglob("*.srt"))
     assert not list((tmp_path/"out").rglob("*.ass"))

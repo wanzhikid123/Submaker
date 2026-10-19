@@ -24,6 +24,7 @@ from .pipeline import Scheduler
 from .store import Store
 from .telemetry import GpuMonitor, api_notice, api_provider_records, gpu_details, gpu_role, provider_detail_lines
 from .gpu_widgets import GpuWorkerStatus
+from .local_widgets import LocalModelEditor, LocalRoleEditor
 
 STYLE = """
 QWidget { background:#faf9f5; color:#34332f; font-family:'Microsoft YaHei UI','Segoe UI'; font-size:13px; }
@@ -428,11 +429,28 @@ class SettingsDialog(QDialog):
         self.resize(1040, 860)
         self.settings = Settings.from_dict(settings.as_dict())
         outer = QVBoxLayout(self)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(label("翻译与审校运行方式", "section"))
+        self.llm_mode = QComboBox()
+        self.llm_mode.addItem("网络 API · 多接口并行", "api")
+        self.llm_mode.addItem("本地模型 · 禁用网络 API", "local")
+        self.llm_mode.setCurrentIndex(max(0, self.llm_mode.findData(settings.llm_mode)))
+        mode_row.addWidget(self.llm_mode, 1)
+        outer.addLayout(mode_row)
+        self.mode_note = label("", "muted")
+        self.mode_note.setWordWrap(True)
+        outer.addWidget(self.mode_note)
         tabs = QTabWidget()
+        self.tabs = tabs
         self.pool = TranslationPoolEditor(settings)
         self.translate = self.pool.editors[0]
         self.review = ProfileEditor(settings.review or settings.translate, "review", settings.review is None)
-        tabs.addTab(self.pool, "翻译接口池")
+        self.local_translate = LocalRoleEditor(settings.local_translate)
+        self.local_review = LocalRoleEditor(settings.local_review, review=True)
+        self.translation_stack = QStackedWidget()
+        self.translation_stack.addWidget(self.pool)
+        self.translation_stack.addWidget(self.local_translate)
+        tabs.addTab(self.translation_stack, "翻译设置")
         review_page = QWidget()
         review_layout = QVBoxLayout(review_page)
         review_note = label("新任务的全片上下文、审校、自动修正和文件名翻译统一使用此接口及模型。已有任务保留其保存的修正方式。", "muted")
@@ -442,7 +460,12 @@ class SettingsDialog(QDialog):
         review_scroll.setWidgetResizable(True)
         review_scroll.setWidget(self.review)
         review_layout.addWidget(review_scroll)
-        tabs.addTab(review_page, "全片审校 / 文件名")
+        self.review_stack = QStackedWidget()
+        self.review_stack.addWidget(review_page)
+        self.review_stack.addWidget(self.local_review)
+        tabs.addTab(self.review_stack, "审校 / 文件名")
+        self.local_model_editor = LocalModelEditor(settings.local_model)
+        tabs.addTab(self.local_model_editor, "本地模型 / GPU")
         video = QWidget()
         video_form = QFormLayout(video)
         video_form.setSpacing(16)
@@ -465,9 +488,24 @@ class SettingsDialog(QDialog):
         self.size_mode.currentIndexChanged.connect(lambda: self.video_bitrate.setEnabled(self.size_mode.currentData() == "bitrate"))
         for caption, field in (("输出编码", self.codec), ("GPU 速度预设", self.encoder_speed), ("画面质量", self.video_quality), ("体积策略", self.size_mode), ("目标视频码率", self.video_bitrate)):
             video_form.addRow(caption, field)
-        encoding_note = label("全部速度档位使用 V100 NVENC。解码与字幕滤镜按线程预算并行，保留所选画质参数。\nP7 / very slow 使用全分辨率双遍；预计大小包含音轨，实际大小受画面复杂度影响。", "muted")
-        encoding_note.setWordWrap(True)
-        video_form.addRow(encoding_note)
+        self.video_concurrency = spin(settings.video_concurrency, 1, 6, " 路")
+        self.encoding_requested = settings.video_concurrency
+        self.video_concurrency.valueChanged.connect(self.encoding_limit_changed)
+        self.video_concurrency.setToolTip("所有视频和分段共享的编码上限。双卡自动分配最多6路，每卡最多3路；本地模型模式最多3路。待编码视频优先分配首路。")
+        self.video_segmented = QCheckBox("单片分段并行 · 自动利用空闲编码槽")
+        self.video_segmented.setChecked(settings.video_segmented)
+        self.video_segmented.setToolTip("30秒以上视频可按短块并行编码，共享当前全局上限，双卡最多6路；压缩块通过有界RAM按顺序写入成品，音轨完整复制。关闭可使用整片单路编码。")
+        self.video_decode_threads = spin(settings.video_decode_threads, 0, os.cpu_count() or 16)
+        self.video_filter_threads = spin(settings.video_filter_threads, 0, os.cpu_count() or 16)
+        for widget in (self.video_decode_threads, self.video_filter_threads):
+            widget.setSpecialValueText("自动分配")
+            widget.setToolTip("手动值按每路视频生效；自动值按全局 CPU 线程预算和编码并发上限计算。")
+        for caption, field in (("全局编码路数上限", self.video_concurrency), ("每路解码 CPU 线程", self.video_decode_threads), ("每路字幕渲染 CPU 线程", self.video_filter_threads)):
+            video_form.addRow(caption, field)
+        video_form.addRow("单片加速", self.video_segmented)
+        self.encoding_note = label("", "muted")
+        self.encoding_note.setWordWrap(True)
+        video_form.addRow(self.encoding_note)
         tabs.addTab(video, "视频编码")
         general = QWidget()
         form = QFormLayout(general)
@@ -481,6 +519,7 @@ class SettingsDialog(QDialog):
         self.chunk.setToolTip("单窗口最大10分钟；识别句子会在窗口完成前送去翻译")
         self.ram = spin(settings.ram_gib, 1, 24, " GiB")
         self.inflight = spin(settings.in_flight, 1, 6)
+        self.inflight.setToolTip("默认 4 个。在途上限至少为 4 时，才能让 3 个视频编码的同时继续识别第 4 个视频。")
         self.audio = spin(settings.audio_stream, -1, 128)
         self.audio.setSpecialValueText("自动选择匹配源语言的默认音轨")
         self.encode = QComboBox()
@@ -518,7 +557,7 @@ class SettingsDialog(QDialog):
         pv.addWidget(self.glossary)
         tabs.addTab(prompts, "翻译与术语")
         outer.addWidget(tabs)
-        notice = label("保存后，新任务使用新配置；已有任务可选择“使用当前设置重试”。运行中的资源设置在重新启动工作台后生效。", "muted")
+        notice = label("新任务使用新配置，已有任务请“使用当前设置重试”。更改运行资源前请暂停并等待在途任务停止；空闲保存后生效。", "muted")
         notice.setWordWrap(True)
         outer.addWidget(notice)
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
@@ -527,17 +566,61 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         outer.addWidget(buttons)
+        self.encode.currentIndexChanged.connect(self.encoding_capacity_changed)
+        self.video_gpu.currentIndexChanged.connect(self.encoding_capacity_changed)
+        self.llm_mode.currentIndexChanged.connect(self.mode_changed)
+        self.mode_changed()
+        if parent and getattr(parent, "scheduler", None) and parent.scheduler.active:
+            self.llm_mode.setEnabled(False)
+            self.local_model_editor.setEnabled(False)
+            for widget in (self.video_concurrency, self.video_segmented, self.video_decode_threads, self.video_filter_threads, self.inflight):
+                widget.setEnabled(False)
+            self.llm_mode.setToolTip("请先暂停并等待任务停止，再切换模型运行方式")
+
+    def mode_changed(self):
+        local = self.llm_mode.currentData() == "local"
+        self.translation_stack.setCurrentIndex(1 if local else 0)
+        self.review_stack.setCurrentIndex(1 if local else 0)
+        self.pool.setEnabled(not local)
+        self.review.setEnabled(not local)
+        self.tabs.setTabEnabled(2, local)
+        self.mode_note.setText("本地模式 · 所有语言处理仅调用本机模型，网络 API 已停用。翻译与审校分别设置；专用 GPU 自动避开 Whisper 和视频处理。" if local else "网络 API 模式 · 翻译接口池并行领取字幕，审校与自动修正统一使用审校接口。")
+        self.encoding_capacity_changed()
+
+    def encoding_limit_changed(self, value):
+        self.encoding_requested = value
+
+    def encoding_capacity_changed(self):
+        selection = dataclasses.replace(self.settings, llm_mode=self.llm_mode.currentData(),
+                                        encoding=self.encode.currentData(), video_gpu=self.video_gpu.currentData())
+        capacity = selection.encoding_capacity()
+        self.video_concurrency.blockSignals(True)
+        self.video_concurrency.setMaximum(capacity)
+        self.video_concurrency.setValue(min(self.encoding_requested, capacity))
+        self.video_concurrency.blockSignals(False)
+        self.encoding_note.setText(f"当前设备最多 {capacity} 路。双卡自动分配最多6路，每卡最多3路；本地模型保留专用卡，CPU兼容编码限1路。\n视频与分段共用名额，满额自动排队。内存按序合并，完整复制音轨并校验全部帧时间戳。\nCPU线程按每路生效，P7使用全分辨率双遍。")
 
     def accept(self):
         try:
             s = self.settings
-            s.translate, s.translators = self.pool.values()
-            review_profile = s.translate if self.review.inherit.isChecked() else self.review.value()
-            if s.translation_profiles() and (not review_profile.url or not review_profile.model):
-                raise ValueError("请为全片审校配置地址和模型，或让主翻译接口提供审校服务。文件名翻译也使用此接口。")
-            self.pool.save_keys()
-            self.review.save_key()
-            s.review = None if self.review.inherit.isChecked() else self.review.value()
+            if self.local_model_editor.busy:
+                raise ValueError("本地模型仍在安装或测试，请等待完成后保存")
+            s.llm_mode = self.llm_mode.currentData()
+            s.local_model = self.local_model_editor.value()
+            s.local_translate, s.local_review = self.local_translate.value(), self.local_review.value()
+            if s.llm_mode == "local":
+                if not Path(s.local_model.model_path).is_file() or not Path(s.local_model.server_path).is_file():
+                    raise ValueError("请先安装或选择 GGUF 文件与本地引擎程序，再保存本地模式")
+                if any(role.max_tokens > s.local_model.context//2 for role in (s.local_translate, s.local_review)):
+                    raise ValueError("本地最大输出 tokens 不能超过上下文长度的一半，请为字幕输入保留空间")
+            else:
+                s.translate, s.translators = self.pool.values()
+                review_profile = s.translate if self.review.inherit.isChecked() else self.review.value()
+                if s.translation_profiles() and (not review_profile.url or not review_profile.model):
+                    raise ValueError("请为全片审校配置地址和模型，或让主翻译接口提供审校服务。文件名翻译也使用此接口。")
+                self.pool.save_keys()
+                self.review.save_key()
+                s.review = None if self.review.inherit.isChecked() else self.review.value()
             s.model_path, s.output_dir = self.model_path.text().strip(), self.output.text().strip()
             s.ffmpeg, s.ffprobe = self.ffmpeg.text().strip(), self.ffprobe.text().strip()
             s.chunk_seconds, s.ram_gib, s.in_flight = self.chunk.value(), self.ram.value(), self.inflight.value()
@@ -545,10 +628,16 @@ class SettingsDialog(QDialog):
             s.video_codec, s.encoder_preset = self.codec.currentData(), self.encoder_speed.currentData()
             s.video_quality, s.size_mode = self.video_quality.value(), self.size_mode.currentData()
             s.video_bitrate_kbps = self.video_bitrate.value()
+            s.video_concurrency = self.video_concurrency.value()
+            s.video_segmented = self.video_segmented.isChecked()
+            s.video_decode_threads, s.video_filter_threads = self.video_decode_threads.value(), self.video_filter_threads.value()
             s.decoding, s.video_gpu = self.decode.currentData(), self.video_gpu.currentData()
             s.show_preview = self.show_preview.isChecked()
             s.bilingual, s.font, s.font_size = self.bilingual.isChecked(), self.font.currentFont().family(), self.font_size.value()
             s.prompt, s.glossary = self.prompt.toPlainText(), self.glossary.toPlainText()
+            parent = self.parent()
+            if parent and getattr(parent, "scheduler", None):
+                parent.scheduler.configure(s)
             s.save()
             super().accept()
         except Exception as exc:
@@ -608,7 +697,7 @@ class MainWindow(QMainWindow):
         self.target = language_combo(self.settings.target)
         side.addWidget(self.target)
         side.addSpacing(10)
-        side.addWidget(label("识别设备", "muted"))
+        side.addWidget(label("GPU 设备 · 识别与编解码", "muted"))
         devices = QHBoxLayout()
         self.gpu0, self.gpu1 = QCheckBox("GPU 0"), QCheckBox("GPU 1")
         self.gpu0.setChecked(0 in self.settings.gpus)
@@ -625,7 +714,7 @@ class MainWindow(QMainWindow):
         side.addWidget(self.model_status)
         self.install_button = button("↓  安装 / 检查模型", self.install_model)
         side.addWidget(self.install_button)
-        side.addWidget(button("API 与高级设置", self.open_settings))
+        side.addWidget(button("模型与高级设置", self.open_settings))
         side.addStretch()
         side.addWidget(label("质量优先 · 内存音频缓存", "eyebrow"))
         small = label("本地识别 → 即时翻译\n全片审校 → 字幕烧录\n完成即清理运行缓存", "muted")
@@ -756,7 +845,19 @@ class MainWindow(QMainWindow):
         self.gpu_timer = QTimer(self)
         self.gpu_timer.timeout.connect(self.refresh_gpu_workers)
         self.gpu_timer.start(250)
+        self.sync_model_resources()
         self.refresh()
+
+    def sync_model_resources(self):
+        local = self.settings.llm_mode == "local"
+        for gpu, widget in enumerate((self.gpu0, self.gpu1)):
+            reserved = local and gpu == self.settings.local_model.gpu
+            widget.setEnabled(not reserved)
+            widget.setToolTip("此 GPU 专用于本地语言模型" if reserved else "用于 Whisper 识别与自动分配的视频编解码；两张都选可启用最多6路编码")
+            if reserved:
+                widget.setChecked(False)
+        if local and not (self.gpu0.isChecked() or self.gpu1.isChecked()):
+            (self.gpu0 if self.settings.local_model.gpu == 1 else self.gpu1).setChecked(True)
 
     def current_settings(self):
         s = Settings.from_dict(self.settings.as_dict())
@@ -813,10 +914,9 @@ class MainWindow(QMainWindow):
     def start(self):
         try:
             s = self.current_settings()
+            self.scheduler.configure(s)
             s.save()
             self.settings = s
-            if not self.scheduler.active:
-                self.scheduler.settings = s
             self.scheduler.start()
             self.status.setText("队列已启动 · 稳定字幕段产出后立即翻译，全部译完进行全片审校")
             self.refresh()
@@ -869,13 +969,15 @@ class MainWindow(QMainWindow):
     def open_settings(self):
         dialog = SettingsDialog(self.current_settings(), self)
         if dialog.exec() == QDialog.Accepted:
+            self.scheduler.configure(dialog.settings)
             self.settings = dialog.settings
+            self.sync_model_resources()
             self.preview_area.setVisible(self.settings.show_preview)
             if self.settings.show_preview:
                 self.show_preview()
             else:
                 self.preview.setRowCount(0)
-            self.status.setText("设置已保存 · 使用当前设置重试可更新已有任务；资源设置变更后请重启工作台")
+            self.status.setText("设置已保存 · 已有任务请使用当前设置重试；本地模式下网络 API 停用" if self.settings.llm_mode == "local" else "设置已保存 · 使用当前设置重试可更新已有任务")
             self.refresh()
 
     def install_model(self):
@@ -912,9 +1014,12 @@ class MainWindow(QMainWindow):
                 self.asr_jobs[gpu] = data.get("job")
                 self.gpu_states[gpu] = event
             elif event == "encoding_started":
-                self.encoding_jobs[gpu] = data.get("job")
+                active = self.encoding_jobs.setdefault(gpu, set())
+                active.add((data.get("job"), data["worker"]) if "worker" in data else data.get("job"))
             elif event == "encoding_done":
-                if self.encoding_jobs.get(gpu) == data.get("job"):
+                active = self.encoding_jobs.get(gpu, set())
+                active.discard((data.get("job"), data["worker"]) if "worker" in data else data.get("job"))
+                if not active:
                     self.encoding_jobs.pop(gpu, None)
             elif event in ("ready", "done", "cancelled", "error", "fatal"):
                 if self.asr_jobs.get(gpu) == data.get("job"):
@@ -1058,19 +1163,33 @@ class MainWindow(QMainWindow):
         mem = psutil.virtual_memory()
         self.stat_values[2].setText(f"{mem.available/1024**3:.1f} GB 可用")
         model = Path(self.settings.model_path, "model.bin")
-        self.model_status.setText("● large-v3 模型已安装" if model.exists() else "○ 尚未安装 large-v3 模型")
+        self.model_status.setText(("● large-v3 模型已安装" if model.exists() else "○ 尚未安装 large-v3 模型") + (f"\n本地翻译 / 审校 · GPU {self.settings.local_model.gpu}\n网络 API 已停用" if self.settings.llm_mode == "local" else "\n网络 API 翻译 / 审校"))
         self.start_button.setText("队列运行中" if self.scheduler.accepting and self.scheduler.active else "开始队列")
 
     def refresh_gpu_workers(self):
         metrics = self.gpu_monitor.snapshot()
-        busy = len(set(self.asr_jobs) | set(self.encoding_jobs))
-        ready = sum(gpu in metrics or self.gpu_states.get(gpu) == "ready" for gpu in self.settings.gpus)
-        self.stat_values[1].setText(f"{busy} / {len(self.settings.gpus)} 工作" if busy else f"{ready} / {len(self.settings.gpus)} 就绪")
-        gpu_text = gpu_details(metrics, self.gpu_states, self.settings.gpus, self.asr_jobs, self.encoding_jobs, video_util=True)
+        enabled = list(self.settings.gpus)
+        busy_gpus = set(self.asr_jobs) | set(self.encoding_jobs)
+        local_role = None
+        if self.settings.llm_mode == "local":
+            gpu = self.settings.local_model.gpu
+            enabled = sorted(set(enabled) | {gpu})
+            state = self.scheduler.client.runtime().snapshot()
+            activity = [r for r in self.scheduler.client.activity_snapshot() if r.get("phase") in ("loading", "request")]
+            local_role = "本地模型加载中" if state["phase"] == "loading" else "本地模型异常" if state["phase"] == "error" else "本地"+activity[0]["kind"] if activity else "本地模型待命" if state["phase"] == "ready" else "本地模型待加载"
+            if state["phase"] == "loading" or activity:
+                busy_gpus.add(gpu)
+        ready = sum(gpu in metrics or self.gpu_states.get(gpu) == "ready" for gpu in enabled)
+        self.stat_values[1].setText(f"{len(busy_gpus)} / {len(enabled)} 工作" if busy_gpus else f"{ready} / {len(enabled)} 就绪")
+        gpu_text = gpu_details(metrics, self.gpu_states, enabled, self.asr_jobs, self.encoding_jobs, video_util=True)
         tooltip = "Tesla V100 · FP16 / NVENC\n"+gpu_text+"\n每1秒后台采样，面板每250毫秒更新；待命时模型仍可能占用显存。"
+        if local_role:
+            tooltip += f"\nGPU {self.settings.local_model.gpu}：{local_role} · {state['message']}"
         self.stat_values[1].setToolTip(tooltip)
         for gpu, worker in self.gpu_workers.items():
-            worker.update_status(metrics.get(gpu, {}), gpu_role(gpu, metrics, self.gpu_states, self.settings.gpus, self.asr_jobs, self.encoding_jobs))
+            role = local_role if local_role and gpu == self.settings.local_model.gpu else gpu_role(gpu, metrics, self.gpu_states, enabled, self.asr_jobs, self.encoding_jobs)
+            worker.update_status(metrics.get(gpu, {}), role,
+                                 state if local_role and gpu == self.settings.local_model.gpu else None)
             worker.setToolTip(tooltip)
 
     def show_preview(self):

@@ -43,6 +43,8 @@ def test_preview_defaults_off_font_dropdown_and_automatic_export_ui(tmp_path, mo
     assert not dialog.show_preview.isChecked()
     assert dialog.encode.currentData() == dialog.decode.currentData() == "hardware"
     assert dialog.codec.currentData() == "hevc"
+    assert dialog.video_segmented.isChecked()
+    dialog.video_segmented.setChecked(False)
     dialog.encoder_speed.setCurrentIndex(dialog.encoder_speed.findData("p7"))
     dialog.font.setCurrentFont(QFont("Segoe UI"))
     dialog.show_preview.setChecked(True)
@@ -50,6 +52,7 @@ def test_preview_defaults_off_font_dropdown_and_automatic_export_ui(tmp_path, mo
     assert dialog.settings.show_preview
     assert dialog.settings.font == dialog.font.currentFont().family()
     assert dialog.settings.encoder_preset == "p7"
+    assert not dialog.settings.video_segmented
     window = MainWindow()
     try:
         assert window.preview_area.isHidden()
@@ -131,6 +134,37 @@ def test_gpu_ring_renders_threshold_colors_and_handles_missing_samples():
         ring.close()
 
 
+def test_encoding_ui_tracks_dual_gpu_local_fixed_gpu_and_cpu_capacity():
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(Settings())
+    try:
+        assert dialog.video_concurrency.maximum() == dialog.video_concurrency.value() == 6
+        dialog.llm_mode.setCurrentIndex(dialog.llm_mode.findData("local"))
+        assert dialog.video_concurrency.maximum() == dialog.video_concurrency.value() == 3
+        dialog.llm_mode.setCurrentIndex(dialog.llm_mode.findData("api"))
+        assert dialog.video_concurrency.maximum() == dialog.video_concurrency.value() == 6
+        dialog.video_gpu.setCurrentIndex(dialog.video_gpu.findData(0))
+        assert dialog.video_concurrency.maximum() == dialog.video_concurrency.value() == 3
+        dialog.video_gpu.setCurrentIndex(dialog.video_gpu.findData(-1))
+        assert dialog.video_concurrency.value() == 6
+        dialog.encode.setCurrentIndex(dialog.encode.findData("quality"))
+        assert dialog.video_concurrency.maximum() == dialog.video_concurrency.value() == 1
+        dialog.encode.setCurrentIndex(dialog.encode.findData("hardware"))
+        assert dialog.video_concurrency.value() == 6
+        dialog.video_concurrency.setValue(2)
+        dialog.llm_mode.setCurrentIndex(dialog.llm_mode.findData("local"))
+        dialog.llm_mode.setCurrentIndex(dialog.llm_mode.findData("api"))
+        assert dialog.video_concurrency.value() == 2
+        assert "当前设备最多 6 路" in dialog.encoding_note.text()
+    finally:
+        dialog.close()
+    single = SettingsDialog(Settings(gpus=[0]))
+    try:
+        assert single.video_concurrency.maximum() == single.video_concurrency.value() == 3
+    finally:
+        single.close()
+
+
 def test_gpu_panel_timer_updates_without_reading_jobs_or_rebuilding_queue(tmp_path, monkeypatch):
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr(Settings, "load", classmethod(lambda cls: Settings()))
@@ -151,7 +185,21 @@ def test_gpu_panel_timer_updates_without_reading_jobs_or_rebuilding_queue(tmp_pa
         window.on_event("gpu", {"gpu": 0, "job": "fixture", "type": "transcribing"})
         assert window.gpu_workers[0].role.text() == "Whisper识别"
         window.on_event("gpu", {"gpu": 0, "job": "fixture", "type": "encoding_started"})
-        assert window.gpu_workers[0].role.text() == "视频编解码"
+        assert window.gpu_workers[0].role.text() == "Whisper识别 / 视频编解码"
+        window.on_event("gpu", {"gpu": 0, "job": "second", "type": "encoding_started"})
+        window.on_event("gpu", {"gpu": 0, "job": "third", "type": "encoding_started"})
+        assert "×3" in window.gpu_workers[0].role.text()
+        window.on_event("gpu", {"gpu": 0, "job": "second", "type": "encoding_done"})
+        assert "×2" in window.gpu_workers[0].role.text()
+        window.on_event("gpu", {"gpu": 0, "job": "third", "type": "encoding_done"})
+        for index in range(3):
+            window.on_event("gpu", {"gpu": 1, "job": "same-movie", "worker": index, "type": "encoding_started"})
+        assert "×3" in window.gpu_workers[1].role.text()
+        window.on_event("gpu", {"gpu": 1, "job": "same-movie", "worker": 1, "type": "encoding_done"})
+        assert "×2" in window.gpu_workers[1].role.text()
+        for index in (0, 2):
+            window.on_event("gpu", {"gpu": 1, "job": "same-movie", "worker": index, "type": "encoding_done"})
+        assert 1 not in window.encoding_jobs
     finally:
         window.close()
         assert not window.gpu_timer.isActive()

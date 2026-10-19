@@ -8,11 +8,21 @@
 secrets/
 settings.json
 profiles.json
+settings*.json
+settings*.yaml
+settings*.yml
+settings*.toml
+profiles*.json
+profiles*.yaml
+profiles*.yml
+profiles*.toml
 credentials.json
 credentials.*
 secrets.json
 secrets.*
 api_keys.*
+.netrc
+_netrc
 *.local
 *.local.*
 *.key
@@ -22,11 +32,16 @@ api_keys.*
 
 # Model weights, videos, subtitles and downloaded assets stay local
 /models/
+# Ollama's hash-named hard links have no weight-file extension. Ignore the
+# complete model index even when the user selects a custom model directory.
+.submaker-local-model/
+.ollama/
 /input/
 /output/
 *.bin
 *.safetensors
 *.gguf
+*.gguf.*
 *.ggml
 *.onnx
 *.pt
@@ -69,6 +84,9 @@ api_keys.*
 /build/
 /dist/
 /delivery/
+/runtime/
+/cache/
+/reports/
 /SubmakerStudio.spec
 *.egg-info/
 *.whl
@@ -90,6 +108,9 @@ api_keys.*
 *.db-*
 *.bak
 *.tmp
+*.part
+*.download
+*.crdownload
 *.dmp
 __pycache__/
 *.py[cod]

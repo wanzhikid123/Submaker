@@ -224,15 +224,18 @@ def video_plan(info, settings):
 
 def video_thread_budget(settings, plan):
     if not plan["encode"]:
-        return {"decode": 1, "filter": 1}
-    # A single input thread serializes native H.264/NVDEC submission. Reserve
-    # equal bounded shares for decode and software subtitle/filter work, per GPU.
-    share = max(1, settings.threads // (2*max(1, len(settings.gpus))))
-    parallel = min(4, share)
-    return {"decode": parallel, "filter": parallel}
+        return {"decode": settings.video_decode_threads or 1, "filter": settings.video_filter_threads or 1}
+    # Reserve CPU work for Whisper/audio and the optional local LLM, then divide
+    # the remaining budget across the configured global number of encoders.
+    reserved = 2*len(settings.gpus)+1+(settings.local_model.threads if settings.llm_mode == "local" else 0)
+    available = max(2, settings.threads-reserved)
+    per_video = max(2, available//max(1, min(6, settings.video_concurrency)))
+    decode = min(4, max(1, per_video//2))
+    filters = min(4, max(1, per_video-decode))
+    return {"decode": settings.video_decode_threads or decode, "filter": settings.video_filter_threads or filters}
 
 
-def burn(source, output, subtitle, info, settings, cancel, on_progress):
+def burn_command(source, output, subtitle, info, settings, segment=None):
     partial = output.with_suffix(".partial.mkv")
     # CWD + a local relative path avoids Windows drive/colon filter escaping.
     relative = Path(os.path.relpath(subtitle, output.parent)).as_posix().replace("'", "'\\''").replace(":", "\\:").replace(",", "\\,").replace("[", "\\[").replace("]", "\\]")
@@ -246,6 +249,19 @@ def burn(source, output, subtitle, info, settings, cancel, on_progress):
         raise RuntimeError("该视频含动态HDR元数据，当前烧录路径不能完整保留；请先提供可保留色彩的静态HDR版本")
     if plan["decode"]:
         vf = "hwdownload,format=" + ("p010le" if ten else "nv12") + "," + vf
+    if segment is not None:
+        start, end = segment
+        seek = max(0, int(start)-1)
+        rate = Fraction(v.get("r_frame_rate") or v.get("avg_frame_rate") or "25")
+        if rate <= 0:
+            raise ValueError("无法确定分段编码帧率")
+        # Seek before the boundary, restore the global subtitle clock, then
+        # select a half-open interval. This also retains variable frame gaps.
+        vf = f"setpts=PTS+round({seek}/TB),trim=start={start:.9f}:end={end:.9f},"+vf
+        # Caption rendering uses global time. A temporary frame-number clock
+        # then gives NVENC the same nominal FPS and rate control as single mode.
+        # The streaming remuxer restores each original PTS before final muxing.
+        vf += f",setpts=N/({rate.numerator}/{rate.denominator}*TB)"
     crf = str(settings.video_quality)
     software_preset = {"quality":"medium","balanced":"fast","fast":"veryfast"}.get(settings.preset,"medium")
     rates = bitrate_plan(info, settings)
@@ -260,13 +276,17 @@ def burn(source, output, subtitle, info, settings, cancel, on_progress):
     args = [settings.ffmpeg, "-hide_banner", "-nostdin", "-y", "-threads", str(thread_budget["decode"])]
     if plan["decode"]:
         args += ["-hwaccel", "cuda", "-hwaccel_device", str(gpu), "-hwaccel_output_format", "cuda"]
+    if segment is not None:
+        args += ["-ss", str(seek), "-t", str(end-seek+2)]
     args += ["-i", str(source), "-map", f"0:{v['index']}"]
-    for stream in info["streams"]:
+    for stream in info["streams"] if segment is None else []:
         if stream["codec_type"] == "video" and stream["index"] != v["index"]:
             args += ["-map", f"0:{stream['index']}"]
     # Burned subtitles are the sole subtitle presentation in the new video.
     # Retaining selectable tracks lets language-preference players add a second set.
-    args += ["-map", "0:a?", "-map", "0:t?", "-map_metadata", "0", "-map_chapters", "0", "-c", "copy", *codec, "-threads:v:0", str(max(1, settings.threads - len(settings.gpus) * 2 - 3)), "-filter_threads", str(thread_budget["filter"]), "-filter:v:0", vf, "-pix_fmt:v:0", "yuv420p10le" if ten or hdr else "yuv420p", "-fps_mode:v:0", "passthrough"]
+    if segment is None:
+        args += ["-map", "0:a?", "-map", "0:t?", "-map_metadata", "0", "-map_chapters", "0"]
+    args += ["-c", "copy", *codec, "-threads:v:0", str(max(1, settings.threads - len(settings.gpus) * 2 - 3)), "-filter_threads", str(thread_budget["filter"]), "-filter:v:0", vf, "-pix_fmt:v:0", "yuv420p10le" if ten or hdr else "yuv420p", "-fps_mode:v:0", "passthrough"]
     if settings.video_codec == "hevc" or ten or hdr:
         if not plan["encode"]:
             parameters = f"pools={max(1,settings.threads-len(settings.gpus)*2-3)}:frame-threads=1" + (":hdr10-opt=1:repeat-headers=1" if hdr else "")
@@ -286,7 +306,42 @@ def burn(source, output, subtitle, info, settings, cancel, on_progress):
         for tag, flag in (("color_primaries", "-color_primaries:v:0"), ("color_transfer", "-color_trc:v:0"), ("color_space", "-colorspace:v:0")):
             if v.get(tag) not in (None, "unknown", "unspecified"):
                 args += [flag, v[tag]]
-    args += ["-max_muxing_queue_size", "4096", "-progress", "pipe:1", "-nostats", str(partial)]
+    if segment is not None:
+        args += ["-enc_time_base:v:0", f"{rate.denominator}/{rate.numerator}", "-mpegts_copyts", "1", "-mpegts_flags", "+resend_headers+initial_discontinuity",
+                 "-muxdelay", "0", "-muxpreload", "0", "-avoid_negative_ts", "disabled", "-progress", "pipe:2", "-nostats", "-f", "mpegts", "pipe:1"]
+    else:
+        args += ["-max_muxing_queue_size", "4096", "-progress", "pipe:1", "-nostats", str(partial)]
+    return args
+
+
+def validate_burn(partial, info, settings):
+    final_info = probe(partial, settings)
+    v = info["video"]
+    hdr = video_plan(info, settings)["hdr"]
+    rotation = next((abs(int(float(s.get("rotation",0)))) % 180 for s in v.get("side_data_list",[]) if s.get("side_data_type")=="Display Matrix"),0)
+    expected_width, expected_height = (v["height"],v["width"]) if rotation == 90 else (v["width"],v["height"])
+    if abs(final_info["duration"] - info["duration"]) > 1.0 or final_info["video"]["width"] != expected_width or final_info["video"]["height"] != expected_height:
+        raise RuntimeError("成品时长或尺寸校验失败，未提交输出")
+    old_audio = [a["codec_name"] for a in info["streams"] if a["codec_type"] == "audio"]
+    new_audio = [a["codec_name"] for a in final_info["streams"] if a["codec_type"] == "audio"]
+    if old_audio != new_audio:
+        raise RuntimeError("音轨保留校验失败")
+    if any(s["codec_type"] == "subtitle" for s in final_info["streams"]):
+        raise RuntimeError("成品不应包含会造成重复显示的软字幕轨")
+    if sum(s["codec_type"] == "attachment" for s in info["streams"]) != sum(s["codec_type"] == "attachment" for s in final_info["streams"]):
+        raise RuntimeError("原有字幕或附件数量校验失败")
+    if len(info.get("chapters", [])) != len(final_info.get("chapters", [])):
+        raise RuntimeError("章节保留校验失败")
+    if hdr and final_info["video"].get("color_transfer") != v.get("color_transfer"):
+        raise RuntimeError("HDR 色彩标志校验失败")
+    for side in v.get("side_data_list", []):
+        if side.get("side_data_type") in ("Mastering display metadata", "Content light level metadata") and not any(s.get("side_data_type") == side["side_data_type"] for s in final_info["video"].get("side_data_list", [])):
+            raise RuntimeError("HDR 静态元数据保留校验失败")
+
+
+def burn(source, output, subtitle, info, settings, cancel, on_progress):
+    partial = output.with_suffix(".partial.mkv")
+    args = burn_command(source, output, subtitle, info, settings)
     # FFmpeg may emit a lot of errors: keep a bounded tail in RAM, never an intermediate video copy.
     p = subprocess.Popen(args, cwd=output.parent, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=CREATE_NO_WINDOW, text=True, encoding="utf-8", errors="replace")
     errors = []
@@ -321,27 +376,7 @@ def burn(source, output, subtitle, info, settings, cancel, on_progress):
             if abort_reason:
                 raise RuntimeError(abort_reason[0])
             raise RuntimeError("视频烧录失败：" + "".join(errors)[-3000:])
-        final_info = probe(partial, settings)
-        rotation = next((abs(int(float(s.get("rotation",0)))) % 180 for s in v.get("side_data_list",[]) if s.get("side_data_type")=="Display Matrix"),0)
-        expected_width, expected_height = (v["height"],v["width"]) if rotation == 90 else (v["width"],v["height"])
-        if abs(final_info["duration"] - info["duration"]) > 1.0 or final_info["video"]["width"] != expected_width or final_info["video"]["height"] != expected_height:
-            raise RuntimeError("成品时长或尺寸校验失败，未提交输出")
-        old_audio = [a["codec_name"] for a in info["streams"] if a["codec_type"] == "audio"]
-        new_audio = [a["codec_name"] for a in final_info["streams"] if a["codec_type"] == "audio"]
-        if old_audio != new_audio:
-            raise RuntimeError("音轨保留校验失败")
-        if any(s["codec_type"] == "subtitle" for s in final_info["streams"]):
-            raise RuntimeError("成品不应包含会造成重复显示的软字幕轨")
-        for kind in ("attachment",):
-            if sum(s["codec_type"] == kind for s in info["streams"]) != sum(s["codec_type"] == kind for s in final_info["streams"]):
-                raise RuntimeError("原有字幕或附件数量校验失败")
-        if len(info.get("chapters", [])) != len(final_info.get("chapters", [])):
-            raise RuntimeError("章节保留校验失败")
-        if hdr and final_info["video"].get("color_transfer") != v.get("color_transfer"):
-            raise RuntimeError("HDR 色彩标志校验失败")
-        for side in v.get("side_data_list",[]):
-            if side.get("side_data_type") in ("Mastering display metadata", "Content light level metadata") and not any(s.get("side_data_type")==side["side_data_type"] for s in final_info["video"].get("side_data_list",[])):
-                raise RuntimeError("HDR 静态元数据保留校验失败")
+        validate_burn(partial, info, settings)
         if output.exists():
             raise RuntimeError("输出路径被其他程序占用，拒绝覆盖")
         os.rename(partial, output)

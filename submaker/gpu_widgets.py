@@ -71,18 +71,29 @@ class GpuWorkerStatus(QWidget):
         details = QVBoxLayout()
         details.setSpacing(4)
         self.role, self.memory, self.video = QLabel("读取状态中"), QLabel("显存 —"), QLabel("解码 — · 编码 —")
+        self.speed = QLabel()
+        self.speed.setStyleSheet("font-size:12px;font-weight:600;color:#b87355;")
+        self.speed.hide()
         for text in (self.role, self.memory, self.video):
             text.setWordWrap(True)
             text.setMinimumWidth(0)
             details.addWidget(text)
+        details.insertWidget(1, self.speed)
         self.role.setStyleSheet("font-size:12px;font-weight:600;color:#484438;")
         self.memory.setStyleSheet("font-size:11px;color:#77746b;")
         self.video.setStyleSheet("font-size:11px;color:#77746b;")
         layout.addLayout(details, 1)
 
-    def update_status(self, values, role):
+    def update_status(self, values, role, local=None):
         self.ring.set_utilization(values.get("utilization"))
         self.role.setText(role)
+        self.speed.setVisible(local is not None)
+        if local is not None:
+            speed = local.get("tokens_per_second")
+            measured = isinstance(speed, (int, float)) and math.isfinite(speed) and speed >= 0
+            self.speed.setText((f"{speed:.1f}" if measured else "—")+" tokens/s")
+            phase = {"generating": "生成中", "sampling": "正在采样", "prefill": "处理输入中", "idle": "待命"}.get(local.get("speed_phase"), "暂无速度数据")
+            self.speed.setToolTip(f"{phase} · 当前输出生成速度\n最近约3秒平滑，不含输入处理时间；请求切换后重新采样。")
         if values.get("memory_used") is not None and values.get("memory_total"):
             self.memory.setText(f"显存 {values['memory_used']/1024:.1f}/{values['memory_total']/1024:.0f} GiB")
         else:

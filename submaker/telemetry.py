@@ -63,7 +63,14 @@ def gpu_role(gpu, metrics, states, enabled, asr_jobs=None, encoding_jobs=None, j
     if gpu not in enabled:
         return "未启用"
     if gpu in encoding_jobs:
-        return "视频编解码" if job is None or encoding_jobs[gpu] == job else "其他任务编解码"
+        active = encoding_jobs[gpu]
+        active = {active} if isinstance(active, str) else active
+        role = "视频编解码" if job is None or any(x == job or isinstance(x, tuple) and x[0] == job for x in active) else "其他任务编解码"
+        if len(active) > 1:
+            role += f" ×{len(active)}"
+        if gpu in asr_jobs:
+            role = ("音轨准备" if state == "extracting" else "Whisper识别")+" / "+role
+        return role
     if gpu in asr_jobs:
         role = "音轨准备" if state == "extracting" else "Whisper识别"
         return "其他任务"+role if job is not None and asr_jobs[gpu] != job else role
@@ -163,6 +170,8 @@ def provider_detail_lines(row, activity=(), quotas=(), queued=0, now=None):
             state = "内容拦截" if "内容策略拦截" in fault else "拒绝请求" if "模型拒绝" in fault else "额度不足" if "额度不足" in fault else "接口异常"
         elif retry:
             state = f"429退避 {retry}秒"
+        elif any(r.get("phase") == "loading" for r in active):
+            state = "正在加载本地模型"
         elif running:
             state = "请求中"
         elif (waiting or queued) and rpm_wait:
