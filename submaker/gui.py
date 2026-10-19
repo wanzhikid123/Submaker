@@ -923,6 +923,7 @@ class MainWindow(QMainWindow):
             self.refresh_gpu_workers()
         elif kind == "error":
             self.status.setText("任务等待处理：" + data["error"])
+            self.refresh()
         elif kind == "complete":
             self.status.setText("任务完成，缓存已清理：" + Path(data["output"]).name)
         elif kind == "usage":
@@ -965,7 +966,9 @@ class MainWindow(QMainWindow):
             p.setRange(0, 100)
             progress = self.progress.get(row["id"], {})
             p.setValue(100 if row["state"].startswith("完成") else int(progress.get("progress", 0)*100))
-            p.setFormat(progress.get("stage", row["state"]))
+            inactive = row["state"] in ("等待处理", "已暂停", "等待恢复") or row["state"].startswith("完成")
+            p.setFormat(row["state"] if inactive else progress.get("stage", row["state"]))
+            p.setToolTip(row["detail"])
             p.setFixedHeight(22)
             progress_cell = QWidget()
             progress_layout = QVBoxLayout(progress_cell)
@@ -1024,13 +1027,15 @@ class MainWindow(QMainWindow):
                     notices.append((name+"：" if name else "")+notice)
                 limited = status_row.get("api_state") in ("paused", "quota", "timeout", "server_error") or (status_row.get("api_retry_at") or 0) > time.time()
                 if limited and notice and not row["state"].startswith("完成"):
-                    warnings.append((name+"：" if name else "")+notice)
+                    repeated = row["state"] == "等待处理" and status_row.get("api_message") and status_row["api_message"] in row["detail"]
+                    if not repeated:
+                        warnings.append((name+"：" if name else "")+notice)
                     warning = True
             if not notices and requests:
                 last_error = next((r["last_error"] for r in reversed(requests) if r.get("last_error")), "")
                 if last_error:
                     lines.append(last_error)
-            if row["state"] == "等待处理" and "HTTP 429" in row["detail"]:
+            if row["state"] == "等待处理" and row["detail"]:
                 warnings.append(row["detail"])
                 warning = True
             detail = QTableWidgetItem("\n".join(lines))

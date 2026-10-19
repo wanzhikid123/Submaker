@@ -331,7 +331,8 @@ def test_pipeline_keeps_completed_single_provider_units_when_pool_is_added(tmp_p
     client._post = post
     store = Store(tmp_path/"jobs.sqlite")
     job = store.add(source, settings)
-    scheduler = Scheduler(store, settings, client=client)
+    progress_events = []
+    scheduler = Scheduler(store, settings, callback=lambda kind, data: progress_events.append(data) if kind == "progress" else None, client=client)
     try:
         scheduler.start()
         deadline = time.monotonic()+4
@@ -343,6 +344,8 @@ def test_pipeline_keeps_completed_single_provider_units_when_pool_is_added(tmp_p
         while scheduler.active and time.monotonic() < deadline:
             time.sleep(.01)
         assert store.jobs()[0]["state"] == "完成", store.jobs()[0]["detail"]
+        assert any(e["stage"] == "全片审校 0/1" for e in progress_events)
+        assert any(e["stage"] == "全片审校 1/1" for e in progress_events)
         assert calls == ["a"], "Adding capacity bought already translated units again"
         assert not store.db.execute("select 1 from checkpoints where job=?", (job,)).fetchone()
     finally:

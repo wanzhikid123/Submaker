@@ -53,6 +53,8 @@ def test_rate_limit_notice_counts_down_and_marks_recovery():
     assert api_notice(row).startswith("翻译等待恢复：HTTP 429")
     row.update(state="处理中", api_state="paused", api_message="HTTP 429：接口额度不足", api_retry_at=150)
     assert "额度不足" in api_notice(row,100) and "退避" not in api_notice(row,100)
+    row.update(api_message="内容策略拦截（content_filter: PROHIBITED_CONTENT）", api_code=200)
+    assert "PROHIBITED_CONTENT" in api_notice(row,100) and "退避" not in api_notice(row,100)
 
 
 def test_retry_after_accepts_seconds_and_http_dates():

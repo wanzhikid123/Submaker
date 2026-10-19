@@ -54,6 +54,20 @@ class APIResponseInvalid(APIError):
     """A reply arrived, but it cannot safely be consumed as structured data."""
 
 
+def generation_stop_message(reason):
+    # Gateways can put arbitrary text here. Retain public reason codes only,
+    # never an echoed prompt, credential or response body.
+    reason = reason if isinstance(reason, str) else ""
+    codes = re.findall(r"\b(?:PROHIBITED_CONTENT|SAFETY|BLOCKLIST|SPII|RECITATION|LANGUAGE|OTHER)\b", reason.upper())
+    if "content_filter" in reason.lower() or any(c in codes for c in ("PROHIBITED_CONTENT", "SAFETY", "BLOCKLIST", "SPII")):
+        label = "内容策略拦截"
+        code = "content_filter" + (": " + codes[0] if codes else "")
+    else:
+        label = "模型回复未完整结束"
+        code = codes[0] if codes else reason if reason in ("tool_calls", "function_call") else "未识别的终止原因"
+    return f"{label}（{code}）；未获得可用结果，已保留恢复点"
+
+
 def retry_delay(header, default):
     try:
         seconds = float(header)
@@ -463,7 +477,9 @@ class Client:
                         if failover:
                             raise APIFailover(f"服务端暂时不可用 HTTP {response.status_code}")
                         if attempt == 2:
-                            raise APIError(f"接口暂时不可用 HTTP {response.status_code}，已停止重试")
+                            message = f"接口暂时不可用 HTTP {response.status_code}，已停止重试；已保留恢复点"
+                            self._notify(profile, semaphore, "paused", response.status_code, message, attempt+1)
+                            raise APIError(f"{profile.name} · {kind}：{message}")
                         delay = min(20, max(1, int(response.headers.get("retry-after", "0")) if response.headers.get("retry-after", "").isdigit() else 0, 2 ** attempt))
                         if cancel is not None and cancel.wait(delay):
                             raise Cancelled()
@@ -492,11 +508,17 @@ class Client:
                     self.usage(result.get("usage", {}))
                     choice = result["choices"][0]
                     if choice.get("finish_reason") == "length":
-                        raise APITruncated("模型输出长度不足")
+                        message = "模型输出长度不足；可拆分的批次将自动拆分重试，否则保留恢复点等待处理"
+                        self._notify(profile, semaphore, "paused", 200, message, attempt+1)
+                        raise APITruncated(f"{profile.name} · {kind}：{message}")
                     if choice.get("finish_reason") not in (None, "stop"):
-                        raise APIError("模型回复未完整结束：" + str(choice.get("finish_reason")))
+                        message = generation_stop_message(choice.get("finish_reason"))
+                        self._notify(profile, semaphore, "paused", 200, message, attempt+1)
+                        raise APIError(f"{profile.name} · {kind}：{message}")
                     if choice["message"].get("refusal"):
-                        raise APIError("模型拒绝了该请求，请查看任务提示")
+                        message = "模型拒绝请求；未获得可用结果，已保留恢复点"
+                        self._notify(profile, semaphore, "paused", 200, message, attempt+1)
+                        raise APIError(f"{profile.name} · {kind}：{message}")
                     text = choice["message"].get("content")
                     if not isinstance(text, str):
                         raise APIResponseInvalid("接口没有返回有效文本")
@@ -513,7 +535,9 @@ class Client:
                     if failover:
                         raise APIFailover("请求超时或连接中断") from exc
                     if attempt == 2:
-                        raise APIError("网络超时或连接中断；部分请求可能已产生用量，请稍后重试") from exc
+                        message = "网络超时或连接中断；已停止重试并保留恢复点，部分请求可能已产生用量"
+                        self._notify(profile, semaphore, "paused", 0, message, attempt+1)
+                        raise APIError(f"{profile.name} · {kind}：{message}") from exc
                     if cancel is not None and cancel.wait(2 ** attempt):
                         raise Cancelled()
                 except (KeyError, IndexError, TypeError, AttributeError, json.JSONDecodeError, APIResponseInvalid) as exc:
@@ -521,7 +545,9 @@ class Client:
                     # complete reply, using the same model, effort and supplied content.
                     last_response_error = str(exc) if isinstance(exc, APIResponseInvalid) else "模型返回的数据结构或 JSON 无效"
                     if attempt == 2:
-                        raise APIResponseInvalid(last_response_error + "（最多3次请求后仍未通过格式校验）") from exc
+                        message = last_response_error + "（最多3次请求后仍未通过格式校验）；已保留恢复点"
+                        self._notify(profile, semaphore, "paused", 200, message, attempt+1)
+                        raise APIResponseInvalid(f"{profile.name} · {kind}：{message}") from exc
                     correction = {"validation_error": last_response_error, "instruction": "Reissue one complete valid JSON object matching the original schema. Copy IDs exactly from the supplied units. Do not include Markdown or explanations. Do not omit issues merely to satisfy validation."}
                     body["messages"] = body["messages"][:2] + [{"role": "user", "content": json.dumps(correction, ensure_ascii=False)}]
                 finally:

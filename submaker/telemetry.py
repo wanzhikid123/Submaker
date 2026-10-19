@@ -97,14 +97,14 @@ def api_notice(row, now=None):
     limit, configured = row.get("api_effective_limit") or 0, row.get("api_configured_limit") or 0
     count = row.get("api_rate_limits") or 0
     parallel = f" · 实际并发上限 {limit}/{configured}" if configured else ""
-    if row.get("api_state") in ("paused", "quota") and "额度不足" in (row.get("api_message") or ""):
+    if row.get("api_state") in ("paused", "quota") and row.get("api_message"):
         return row["api_message"] + parallel
     if row.get("state") == "等待处理" and "HTTP 429" in (row.get("detail") or ""):
         return row["detail"] + parallel
     if remaining:
         return f"HTTP 429 限流退避 · {remaining}秒后可重试{parallel}"
     if row.get("api_state") in ("paused", "quota"):
-        return (row.get("api_message") or "接口限流，任务已暂停") + parallel
+        return (row.get("api_message") or "接口异常，任务等待处理") + parallel
     if row.get("api_state") in ("timeout", "server_error"):
         return (row.get("api_message") or "接口请求异常，正在重试") + parallel
     rpm_remaining = max(0, int((row.get("api_rpm_ready_at") or 0)-now+.999))
@@ -156,7 +156,7 @@ def provider_detail_lines(row, activity=(), quotas=(), queued=0, now=None):
         if row.get("state", "").startswith("完成"):
             state = "已完成"
         elif fault:
-            state = "额度不足" if "额度不足" in fault else "接口异常"
+            state = "内容拦截" if "内容策略拦截" in fault else "拒绝请求" if "模型拒绝" in fault else "额度不足" if "额度不足" in fault else "接口异常"
         elif retry:
             state = f"429退避 {retry}秒"
         elif running:

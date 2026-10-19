@@ -490,13 +490,14 @@ class Scheduler:
                     brief = "\n".join(briefs)
                     issues = []
                     batches = list(split_rows(rows))
+                    self.emit(ident, f"全片审校 0/{len(batches)}", 0.60, "逐段覆盖检查，等待首批审校结果")
                     for i, batch in enumerate(batches):
                         check(cancel)
                         # Include neighbors to audit sentence/terminology continuity across windows.
                         offset = rows.index(batch[0])
                         context_rows = rows[max(0, offset-3): min(len(rows), offset+len(batch)+3)]
                         issues.extend(audit_call("review", {"round": 0, "rows": context_rows, "brief": brief}, lambda: self.client.review(settings, context_rows, brief, cancel)))
-                        self.emit(ident, "全片审校", 0.60 + 0.12 * (i+1)/len(batches), f"一次审校 · 覆盖 {i+1}/{len(batches)}")
+                        self.emit(ident, f"全片审校 {i+1}/{len(batches)}", 0.60 + 0.12 * (i+1)/len(batches), f"一次审校 · 覆盖 {i+1}/{len(batches)}")
                     # Neighboring windows may report the same issue more than once.
                     issues = list({json.dumps(x, sort_keys=True, ensure_ascii=False): x for x in issues}.values())
                     audit_state = {"brief": brief, "translations": translations, "issues": issues, "repaired": []}

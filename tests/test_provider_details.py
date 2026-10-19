@@ -5,7 +5,7 @@ import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QProgressBar
 from PySide6.QtCore import QCoreApplication, QEvent
 
 from submaker.config import Profile, Settings
@@ -101,3 +101,41 @@ def test_task_details_keep_all_enabled_names_after_active_request_disappears(tmp
         # can trigger Python GC and dispose of Qt objects from a worker thread.
         window.deleteLater()
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+
+def test_review_count_and_terminal_failure_are_visible_without_other_provider_erasing_them(tmp_path, monkeypatch):
+    settings, _ = settings_and_row()
+    monkeypatch.setattr(Settings, "load", classmethod(lambda cls: settings))
+    monkeypatch.setattr("submaker.gui.Store", lambda: Store(tmp_path/"jobs.sqlite"))
+    window = MainWindow()
+    try:
+        source = tmp_path/"fixture.mp4"
+        source.write_bytes(b"fixture")
+        job = window.store.add(source, settings)
+        window.media_info[job] = {"error": "fixture"}
+        window.store.update(job, "处理中", "一次审校 · 覆盖 12/17")
+        window.on_event("progress", {"job": job, "stage": "全片审校 12/17", "progress": .68})
+        window.refresh()
+        bar = window.queue.cellWidget(0, 2).findChild(QProgressBar)
+        assert bar.format() == "全片审校 12/17" and bar.value() == 68
+        error = "Gemini · 翻译：内容策略拦截（content_filter: PROHIBITED_CONTENT）；已保留恢复点"
+        window.store.record_api(job, {"event": "paused", "profile_id": profile_tag(settings.translators[0]), "profile_name": "Gemini", "code": 200, "message": "内容策略拦截（content_filter: PROHIBITED_CONTENT）"})
+        window.store.update(job, "等待处理", error)
+        window.on_event("error", {"job": job, "error": error})
+        assert not window.api_banner.isHidden()
+        assert "Gemini" in window.api_banner.text() and "PROHIBITED_CONTENT" in window.api_banner.text()
+        assert window.api_banner.text().count("PROHIBITED_CONTENT") == 1
+        assert window.queue.cellWidget(0, 2).findChild(QProgressBar).format() == "等待处理"
+        assert "Gemini：内容拦截" in window.queue.item(0, 5).text()
+        window.store.record_api(job, {"event": "success", "profile_id": profile_tag(settings.translate), "profile_name": "ChatGPT", "code": 200})
+        window.refresh()
+        assert not window.api_banner.isHidden() and "PROHIBITED_CONTENT" in window.api_banner.text()
+        # Even a local failure without an API status event needs an immediate banner.
+        with window.store.db:
+            window.store.db.execute("DELETE FROM api_providers WHERE job=?", (job,))
+        window.store.update(job, "等待处理", "输出目录不可写；恢复点已保存")
+        window.on_event("error", {"job": job, "error": "输出目录不可写；恢复点已保存"})
+        assert "输出目录不可写" in window.api_banner.text()
+    finally:
+        window.close()
+        window.store.close()
