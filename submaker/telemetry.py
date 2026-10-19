@@ -40,13 +40,14 @@ class GpuMonitor:
 
     def _poll(self):
         while not self.stopped.is_set():
+            started = time.monotonic()
             try:
                 rows = read_gpu_status()
             except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
                 rows = {}
             with self.lock:
                 self.rows = rows
-            self.stopped.wait(3)
+            self.stopped.wait(max(0.1, 1.0-(time.monotonic()-started)))
 
     def snapshot(self):
         with self.lock:
@@ -56,28 +57,30 @@ class GpuMonitor:
         self.stopped.set()
 
 
-def gpu_details(metrics, states, enabled, asr_jobs=None, encoding_jobs=None, job=None, video_util=False):
+def gpu_role(gpu, metrics, states, enabled, asr_jobs=None, encoding_jobs=None, job=None):
     asr_jobs, encoding_jobs = asr_jobs or {}, encoding_jobs or {}
+    values, state = metrics.get(gpu, {}), states.get(gpu)
+    if gpu not in enabled:
+        return "未启用"
+    if gpu in encoding_jobs:
+        return "视频编解码" if job is None or encoding_jobs[gpu] == job else "其他任务编解码"
+    if gpu in asr_jobs:
+        role = "音轨准备" if state == "extracting" else "Whisper识别"
+        return "其他任务"+role if job is not None and asr_jobs[gpu] != job else role
+    if state == "error":
+        return "异常"
+    if values.get("encoder", 0) or values.get("decoder", 0):
+        return "视频编解码"
+    if values.get("utilization", 0):
+        return "运行中"
+    return "待命" if values else "读取状态中"
+
+
+def gpu_details(metrics, states, enabled, asr_jobs=None, encoding_jobs=None, job=None, video_util=False):
     lines = []
     for gpu in (0, 1):
         values = metrics.get(gpu, {})
-        state = states.get(gpu)
-        if gpu not in enabled:
-            role = "未启用"
-        elif gpu in encoding_jobs:
-            role = "视频编解码" if job is None or encoding_jobs[gpu] == job else "其他任务编解码"
-        elif gpu in asr_jobs:
-            role = "音轨准备" if state == "extracting" else "Whisper识别"
-            if job is not None and asr_jobs[gpu] != job:
-                role = "其他任务" + role
-        elif state == "error":
-            role = "异常"
-        elif values.get("encoder", 0) or values.get("decoder", 0):
-            role = "视频编解码"
-        elif values.get("utilization", 0):
-            role = "运行中"
-        else:
-            role = "待命" if values else "读取状态中"
+        role = gpu_role(gpu, metrics, states, enabled, asr_jobs, encoding_jobs, job)
         utilization = "—" if values.get("utilization") is None else f"{values['utilization']:.0f}%"
         memory = f" · 显存 {values['memory_used']/1024:.1f}/{values['memory_total']/1024:.0f} GiB" if values.get("memory_used") is not None and values.get("memory_total") else ""
         lines.append(f"GPU {gpu}：{role} · 利用率 {utilization}{memory}")

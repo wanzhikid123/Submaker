@@ -13,7 +13,7 @@ from submaker.dispatch import FairTranslationExecutor
 from submaker.llm import APIError, Client, Gate, JOB_CONTEXT, retry_delay
 from submaker.pipeline import Scheduler
 from submaker.store import Store
-from submaker.telemetry import api_notice, gpu_details
+from submaker.telemetry import GpuMonitor, api_notice, gpu_details
 
 
 def test_both_gpu_statuses_are_present_and_distinguish_job_roles():
@@ -22,6 +22,24 @@ def test_both_gpu_statuses_are_present_and_distinguish_job_roles():
     assert "GPU 0：Whisper识别" in value and "75%" in value
     assert "GPU 1：待命" in value and "显存" in value
     assert "未启用" in gpu_details(metrics,{},[0])
+
+
+def test_gpu_monitor_samples_again_within_two_seconds_off_the_main_thread(monkeypatch):
+    observations = []
+    sampled = threading.Event()
+    def sample():
+        observations.append(threading.current_thread().name)
+        if len(observations) >= 2:
+            sampled.set()
+        return {0: {"utilization": 25}}
+    monkeypatch.setattr("submaker.telemetry.read_gpu_status", sample)
+    monitor = GpuMonitor()
+    try:
+        assert sampled.wait(1.8)
+        assert all(name == "gpu-status" for name in observations)
+        assert monitor.snapshot()[0]["utilization"] == 25
+    finally:
+        monitor.stop()
 
 
 def test_rate_limit_notice_counts_down_and_marks_recovery():

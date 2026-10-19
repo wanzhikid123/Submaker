@@ -22,7 +22,8 @@ from .llm import Client, endpoint
 from .media import CREATE_NO_WINDOW, estimate_output, probe
 from .pipeline import Scheduler
 from .store import Store
-from .telemetry import GpuMonitor, api_notice, api_provider_records, gpu_details
+from .telemetry import GpuMonitor, api_notice, api_provider_records, gpu_details, gpu_role
+from .gpu_widgets import GpuWorkerStatus
 
 STYLE = """
 QWidget { background:#faf9f5; color:#34332f; font-family:'Microsoft YaHei UI','Segoe UI'; font-size:13px; }
@@ -653,14 +654,26 @@ class MainWindow(QMainWindow):
             card.setObjectName("card")
             cv = QVBoxLayout(card)
             cv.setContentsMargins(17, 13, 17, 13)
-            cv.addWidget(label(heading, "muted"))
             value_label = label(value, "stat")
-            cv.addWidget(value_label)
-            description_label = label(description, "muted")
-            description_label.setWordWrap(True)
-            cv.addWidget(description_label)
             if heading == "GPU WORKERS":
-                self.gpu_info = description_label
+                header = QHBoxLayout()
+                header.addWidget(label(heading, "muted"))
+                header.addStretch()
+                value_label.setStyleSheet("font-size:14px;font-weight:600;")
+                header.addWidget(value_label)
+                cv.addLayout(header)
+                devices = QHBoxLayout()
+                devices.setSpacing(14)
+                self.gpu_workers = {gpu: GpuWorkerStatus(gpu) for gpu in (0, 1)}
+                for worker in self.gpu_workers.values():
+                    devices.addWidget(worker, 1)
+                cv.addLayout(devices)
+            else:
+                cv.addWidget(label(heading, "muted"))
+                cv.addWidget(value_label)
+                description_label = label(description, "muted")
+                description_label.setWordWrap(True)
+                cv.addWidget(description_label)
             self.stat_values.append(value_label)
             cards.addWidget(card, 2 if heading == "GPU WORKERS" else 1)
         body.addLayout(cards)
@@ -740,6 +753,9 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(1500)
+        self.gpu_timer = QTimer(self)
+        self.gpu_timer.timeout.connect(self.refresh_gpu_workers)
+        self.gpu_timer.start(250)
         self.refresh()
 
     def current_settings(self):
@@ -904,6 +920,7 @@ class MainWindow(QMainWindow):
                 if self.asr_jobs.get(gpu) == data.get("job"):
                     self.asr_jobs.pop(gpu, None)
                 self.gpu_states[gpu] = "error" if event in ("error", "fatal") else "ready"
+            self.refresh_gpu_workers()
         elif kind == "error":
             self.status.setText("任务等待处理：" + data["error"])
         elif kind == "complete":
@@ -934,7 +951,6 @@ class MainWindow(QMainWindow):
         self.queue.setRowCount(len(self.rows))
         self.queue.clearSelection()
         api_activity = self.scheduler.client.activity_snapshot() if hasattr(self.scheduler.client, "activity_snapshot") else []
-        metrics = self.gpu_monitor.snapshot()
         warnings = []
         for i, row in enumerate(self.rows):
             self.queue.setRowHeight(i, 86)
@@ -1046,18 +1062,24 @@ class MainWindow(QMainWindow):
         self.api_banner.setText("接口提示：" + " / ".join(dict.fromkeys(warnings)))
         completed = sum(r["state"].startswith("完成") for r in self.rows)
         self.stat_values[0].setText(f"{len(self.rows)}  /  {completed} 完成")
-        busy = len(set(self.asr_jobs) | set(self.encoding_jobs))
-        ready = sum(gpu in metrics or self.gpu_states.get(gpu) == "ready" for gpu in self.settings.gpus)
-        self.stat_values[1].setText(f"{busy} / {len(self.settings.gpus)} 工作" if busy else f"{ready} / {len(self.settings.gpus)} 就绪")
-        gpu_text = gpu_details(metrics, self.gpu_states, self.settings.gpus, self.asr_jobs, self.encoding_jobs, video_util=True)
-        self.gpu_info.setText(gpu_text)
-        self.gpu_info.setToolTip("Tesla V100 · FP16 / NVENC\n"+gpu_text+"\n每3秒采样设备实际利用率；待命时模型仍可能占用显存。")
-        self.stat_values[1].setToolTip(self.gpu_info.toolTip())
+        self.refresh_gpu_workers()
         mem = psutil.virtual_memory()
         self.stat_values[2].setText(f"{mem.available/1024**3:.1f} GB 可用")
         model = Path(self.settings.model_path, "model.bin")
         self.model_status.setText("● large-v3 模型已安装" if model.exists() else "○ 尚未安装 large-v3 模型")
         self.start_button.setText("队列运行中" if self.scheduler.accepting and self.scheduler.active else "开始队列")
+
+    def refresh_gpu_workers(self):
+        metrics = self.gpu_monitor.snapshot()
+        busy = len(set(self.asr_jobs) | set(self.encoding_jobs))
+        ready = sum(gpu in metrics or self.gpu_states.get(gpu) == "ready" for gpu in self.settings.gpus)
+        self.stat_values[1].setText(f"{busy} / {len(self.settings.gpus)} 工作" if busy else f"{ready} / {len(self.settings.gpus)} 就绪")
+        gpu_text = gpu_details(metrics, self.gpu_states, self.settings.gpus, self.asr_jobs, self.encoding_jobs, video_util=True)
+        tooltip = "Tesla V100 · FP16 / NVENC\n"+gpu_text+"\n每1秒后台采样，面板每250毫秒更新；待命时模型仍可能占用显存。"
+        self.stat_values[1].setToolTip(tooltip)
+        for gpu, worker in self.gpu_workers.items():
+            worker.update_status(metrics.get(gpu, {}), gpu_role(gpu, metrics, self.gpu_states, self.settings.gpus, self.asr_jobs, self.encoding_jobs))
+            worker.setToolTip(tooltip)
 
     def show_preview(self):
         if not self.settings.show_preview:
@@ -1091,6 +1113,7 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
         self.timer.stop()
+        self.gpu_timer.stop()
         self.closing = True
         self.gpu_monitor.stop()
         self.inspector.shutdown(wait=False, cancel_futures=True)

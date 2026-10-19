@@ -7,6 +7,7 @@ from PySide6.QtWidgets import QApplication, QFontComboBox, QPushButton
 
 from submaker.config import Settings
 from submaker.gui import MainWindow, SettingsDialog, STYLE, language_combo, language_value
+from submaker.gpu_widgets import GpuUtilizationRing
 from submaker.store import Store
 
 
@@ -88,8 +89,9 @@ def test_preview_defaults_off_font_dropdown_and_automatic_export_ui(tmp_path, mo
         assert window.queue.item(0,4).text().endswith("实际 文件不可用")
         detail=window.queue.item(0,5).text()
         assert 'GPU 0' not in detail and 'GPU 1' not in detail
-        assert 'GPU 0' in window.gpu_info.text() and 'GPU 1' in window.gpu_info.text()
-        assert '75%' in window.gpu_info.text() and '显存' in window.gpu_info.text()
+        assert 'GPU 0' in window.stat_values[1].toolTip() and 'GPU 1' in window.stat_values[1].toolTip()
+        assert window.gpu_workers[0].ring.utilization == 75
+        assert '显存' in window.gpu_workers[0].memory.text()
         window.store.update(job, "处理中", "模拟执行")
         window.store.record_api(window.rows[0]['id'],{'event':'rate_limit','code':429,'retry_at':time.time()+10,'effective_limit':2,'configured_limit':10})
         window.refresh()
@@ -107,4 +109,50 @@ def test_preview_defaults_off_font_dropdown_and_automatic_export_ui(tmp_path, mo
         assert not window.preview_area.isHidden()
     finally:
         window.close()
+        window.store.close()
+
+
+def test_gpu_ring_renders_threshold_colors_and_handles_missing_samples():
+    app = QApplication.instance() or QApplication([])
+    ring = GpuUtilizationRing(0)
+    try:
+        for value, color in ((0, "#4e906b"), (45, "#4e906b"), (70, "#4e906b"), (70.1, "#d0a132"), (90, "#d0a132"), (90.1, "#cf6557"), (100, "#cf6557")):
+            ring.set_utilization(value)
+            assert ring.ring_color.name() == color
+            pixels = ring.grab().toImage()
+            assert any(pixels.pixelColor(x, y).name() == color for x in range(pixels.width()) for y in range(pixels.height()))
+        for value in (None, float("nan"), float("inf")):
+            ring.set_utilization(value)
+            assert ring.utilization is None
+            assert ring.accessibleDescription() == "—"
+        ring.set_utilization(0)
+        assert ring.accessibleDescription() == "0%"
+    finally:
+        ring.close()
+
+
+def test_gpu_panel_timer_updates_without_reading_jobs_or_rebuilding_queue(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(Settings, "load", classmethod(lambda cls: Settings()))
+    monkeypatch.setattr("submaker.gui.Store", lambda: Store(tmp_path/"jobs.sqlite"))
+    window = MainWindow()
+    try:
+        window.timer.stop()
+        readings = {0: {"utilization": 55, "memory_used": 1024, "memory_total": 16384, "encoder": 22, "decoder": 11}, 1: {"utilization": 92}}
+        window.gpu_monitor.snapshot = lambda: readings
+        window.store.jobs = lambda: (_ for _ in ()).throw(AssertionError("GPU repaint must not read task DB"))
+        deadline = time.monotonic()+.8
+        while window.gpu_workers[0].ring.utilization != 55 and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(.01)
+        assert window.gpu_workers[0].ring.utilization == 55
+        assert window.gpu_workers[1].ring.utilization == 92
+        assert window.gpu_workers[0].video.text() == "解码 11%\n编码 22%"
+        window.on_event("gpu", {"gpu": 0, "job": "fixture", "type": "transcribing"})
+        assert window.gpu_workers[0].role.text() == "Whisper识别"
+        window.on_event("gpu", {"gpu": 0, "job": "fixture", "type": "encoding_started"})
+        assert window.gpu_workers[0].role.text() == "视频编解码"
+    finally:
+        window.close()
+        assert not window.gpu_timer.isActive()
         window.store.close()
