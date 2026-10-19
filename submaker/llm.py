@@ -289,10 +289,18 @@ class Client:
 
     def quota_snapshot(self, settings):
         rows = []
-        for profile in settings.translation_profiles():
+        seen = set()
+        for profile in [*settings.translation_profiles(), settings.review_profile()]:
+            if not profile.url or not profile.model or profile_tag(profile) in seen:
+                continue
+            seen.add(profile_tag(profile))
             gate = self.limits.peek(profile)
-            if gate:
-                rows.append({"name": profile.name, **gate.snapshot()})
+            snapshot = gate.snapshot() if gate else {"effective_limit": max(1, min(16, profile.concurrency)), "active": 0, "waiting": 0, "retry_seconds": 0, "rpm_limit": profile.rpm, "rpm_used": 0, "rpm_wait_seconds": 0}
+            base = profile.url.strip().rstrip("/")
+            url = base if base.endswith("/chat/completions") else base+"/chat/completions"
+            with self.fault_lock:
+                fault = self.faults.get((url, profile.model, profile.effort, profile.key_id), "")
+            rows.append({"name": profile.name, "profile": profile_tag(profile), "fault": fault, **snapshot})
         return rows
 
     def _notify(self, profile, gate, event, code=0, message="", attempt=0):
@@ -408,7 +416,7 @@ class Client:
                 check(cancel)
                 kind = "翻译" if system.startswith("Translate subtitles") else "审校" if system.startswith("Audit every") else "上下文整理" if system.startswith("Create a concise") else "标题" if system.startswith("Translate only") else "接口测试"
                 with self.activity_lock:
-                    self.activity[activity_id] = {"job": JOB_CONTEXT.get(), "kind": kind, "model": profile.model, "profile_name": profile.name, "attempt": attempt+1, "started": time.monotonic(), "timeout": profile.timeout, "last_error": last_response_error, "phase": "queued", "configured_limit": profile.concurrency, "_gate": semaphore}
+                    self.activity[activity_id] = {"job": JOB_CONTEXT.get(), "kind": kind, "model": profile.model, "profile_name": profile.name, "profile_id": profile_tag(profile), "attempt": attempt+1, "started": time.monotonic(), "timeout": profile.timeout, "last_error": last_response_error, "phase": "queued", "configured_limit": profile.concurrency, "_gate": semaphore}
                 self._notify(profile, semaphore, "queued", attempt=attempt+1)
                 if attempt == 0 and reservation:
                     reservation.consumed = True

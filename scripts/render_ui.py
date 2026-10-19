@@ -25,9 +25,9 @@ with tempfile.TemporaryDirectory() as temporary:
     root = Path(temporary)
     store = Store(root / "preview.sqlite")
     settings = Settings()
-    settings.translate.name = "MiniServer"
+    settings.translate.name = "ChatGPT"
     settings.translate.url, settings.translate.model = "https://example.com/v1", "configured-model"
-    settings.translators = [Profile(name="OpenAI", url="https://api.openai.com/v1", model="your-model-id", provider="openai", concurrency=4, rpm=60, key_id="demo-openai"), Profile(name="Google AI", url="https://generativelanguage.googleapis.com/v1beta/openai", model="your-model-id", provider="google", concurrency=3, rpm=30, key_id="demo-google")]
+    settings.translators = [Profile(name="Gemini", url="https://generativelanguage.googleapis.com/v1beta/openai", model="your-model-id", provider="google", concurrency=4, rpm=60, key_id="demo-google"), Profile(name="OpenRouter", url="https://openrouter.ai/api/v1", model="your-model-id", provider="openrouter", concurrency=3, rpm=30, key_id="demo-router")]
     jobs = []
     for name in ("京都散步 · Kyoto Walk.mp4", "海洋故事 · Ocean Stories.mp4", "晨光 · Morning Light.mp4"):
         source = root / name
@@ -35,8 +35,8 @@ with tempfile.TemporaryDirectory() as temporary:
         jobs.append(store.add(source, settings))
     store.update(jobs[0], "处理中", "NVDEC 解码 / HEVC NVENC · 编码 62.4%")
     store.update(jobs[1], "处理中", "边识别边翻译 · 已译 356/412 段")
-    store.record_api(jobs[1], {"profile_id": profile_tag(settings.translate), "profile_name": "MiniServer", "event": "rate_limit", "code": 429, "message": "接口限流", "retry_at": time.time()+20, "effective_limit": 1, "configured_limit": 2})
-    store.record_api(jobs[1], {"profile_id": profile_tag(settings.translators[0]), "profile_name": "OpenAI", "event": "success", "code": 200, "effective_limit": 4, "configured_limit": 4, "rpm_limit": 60, "rpm_used": 16})
+    store.record_api(jobs[1], {"profile_id": profile_tag(settings.translate), "profile_name": "ChatGPT", "event": "rate_limit", "code": 429, "message": "接口限流", "retry_at": time.time()+20, "effective_limit": 1, "configured_limit": 2})
+    store.record_api(jobs[1], {"profile_id": profile_tag(settings.translators[0]), "profile_name": "Gemini", "event": "success", "code": 200, "effective_limit": 4, "configured_limit": 4, "rpm_limit": 60, "rpm_used": 16})
     store.add_usage(jobs[0], {"prompt_tokens": 43120, "completion_tokens": 18470, "total_tokens": 61590})
     store.add_usage(jobs[1], {"prompt_tokens": 28410, "completion_tokens": 12340, "total_tokens": 40750})
     # Sparse design fixture: show a completed output size without generating media.
@@ -67,11 +67,13 @@ with tempfile.TemporaryDirectory() as temporary:
     window.encoding_jobs = {0: jobs[0]}
     window.asr_jobs = {1: jobs[1]}
     window.scheduler.client.activity_snapshot = lambda: [
-        {"job": jobs[1], "profile_name": "MiniServer", "model": "configured-model", "phase": "queued", "started": time.monotonic()-8, "effective_limit": 1, "configured_limit": 2, "rpm_limit": 30, "rpm_used": 12},
-        *[{"job": jobs[1], "profile_name": "OpenAI", "model": "your-model-id", "phase": "request", "started": time.monotonic()-5, "effective_limit": 4, "configured_limit": 4, "rpm_limit": 60, "rpm_used": 16} for _ in range(2)],
+        {"job": jobs[1], "profile_name": "ChatGPT", "model": "configured-model", "phase": "queued", "started": time.monotonic()-8, "effective_limit": 1, "configured_limit": 2, "rpm_limit": 30, "rpm_used": 12},
+        *[{"job": jobs[1], "profile_name": "Gemini", "model": "your-model-id", "phase": "request", "started": time.monotonic()-5, "effective_limit": 4, "configured_limit": 4, "rpm_limit": 60, "rpm_used": 16} for _ in range(2)],
     ]
     window.refresh()
     window.show()
+    app.processEvents()
+    window.refresh()
     for _ in range(4):
         app.processEvents()
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)

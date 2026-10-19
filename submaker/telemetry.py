@@ -125,3 +125,66 @@ def api_provider_records(row):
         enabled = {profile_tag(p) for p in [*settings.translation_profiles(), settings.review_profile()] if p.url and p.model}
         providers = [p for p in providers if p["profile"] in enabled]
     return [(p["name"], {"api_"+key: value for key, value in p.items()}) for p in providers]
+
+
+def provider_detail_lines(row, activity=(), quotas=(), queued=0, now=None):
+    """One stable row per enabled task profile; retain retired profiles' 429 counts."""
+    now = time.time() if now is None else now
+    settings = Settings.from_dict(json.loads(row.get("config") or "{}"))
+    profiles = [(p, p.name) for p in settings.translation_profiles()]
+    current = {profile_tag(p) for p, _ in profiles}
+    review = settings.review_profile()
+    if review.url and review.model and profile_tag(review) not in current:
+        profiles.append((review, review.name+"（全片审校）"))
+        current.add(profile_tag(review))
+    records = {p["profile"]: p for p in row.get("api_providers", [])}
+    lines = []
+    for profile, name in profiles:
+        tag = profile_tag(profile)
+        record = records.get(tag, {})
+        status = {"api_"+key: value for key, value in record.items()}
+        quota = next((q for q in quotas if q.get("profile") == tag or not q.get("profile") and q.get("name") == profile.name), {})
+        active = [r for r in activity if r.get("profile_id") == tag or not r.get("profile_id") and r.get("profile_name") == profile.name and r.get("model") == profile.model]
+        running = sum(r.get("phase", "request") == "request" for r in active)
+        waiting = len(active)-running
+        retry = max(0, int((quota["retry_seconds"] if "retry_seconds" in quota else record.get("retry_at", 0)-now)+.999))
+        rpm_wait = max(0, int((quota["rpm_wait_seconds"] if "rpm_wait_seconds" in quota else record.get("rpm_ready_at", 0)-now)+.999))
+        limit = quota.get("effective_limit", record.get("effective_limit") or profile.concurrency)
+        rpm = quota.get("rpm_limit", profile.rpm)
+        used = quota.get("rpm_used", record.get("rpm_used", 0) if now-record.get("updated", 0) < 60 else None)
+        fault = quota.get("fault") or (record.get("message") if record.get("state") in ("paused", "quota", "timeout", "server_error") else "")
+        if row.get("state", "").startswith("完成"):
+            state = "已完成"
+        elif fault:
+            state = "额度不足" if "额度不足" in fault else "接口异常"
+        elif retry:
+            state = f"429退避 {retry}秒"
+        elif running:
+            state = "请求中"
+        elif (waiting or queued) and rpm_wait:
+            state = f"RPM节流 {rpm_wait}秒"
+        elif waiting or queued and quota.get("active", 0) >= limit:
+            state = "等待并发名额"
+        elif row.get("state") in ("已暂停", "等待恢复", "等待处理"):
+            state = "任务暂停" if row["state"] != "等待处理" else "任务待处理"
+        else:
+            state = "待命"
+        rpm_text = f"RPM {used if used is not None else '—'}/{rpm}" if rpm else "RPM 不限"
+        count = record.get("rate_limits", 0)
+        line = f"{name}：{state} · 请求 {running} / 等待 {waiting} · 并发 {limit}/{profile.concurrency} · {rpm_text} · 429 {count}次"
+        if active:
+            longest = max(0, int(time.monotonic()-min(r.get("started", time.monotonic()) for r in active)))
+            line += f" · {longest}秒"
+        if fault and not row.get("state", "").startswith("完成"):
+            line += "\n  "+fault
+        lines.append(line)
+    historical = {}
+    for tag, record in records.items():
+        if tag not in current and record.get("rate_limits"):
+            name = record.get("name") or "接口"
+            historical[name] = historical.get(name, 0)+record["rate_limits"]
+    for name, count in sorted(historical.items()):
+        lines.append(f"{name}（历史配置）：429 {count}次 · 当前任务未使用此配置")
+    if not records and (row.get("api_rate_limits") or row.get("api_partial")):
+        lines.append("历史接口记录："+api_notice(row, now))
+    return lines

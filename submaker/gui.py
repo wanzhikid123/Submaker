@@ -22,7 +22,7 @@ from .llm import Client, endpoint
 from .media import CREATE_NO_WINDOW, estimate_output, probe
 from .pipeline import Scheduler
 from .store import Store
-from .telemetry import GpuMonitor, api_notice, api_provider_records, gpu_details, gpu_role
+from .telemetry import GpuMonitor, api_notice, api_provider_records, gpu_details, gpu_role, provider_detail_lines
 from .gpu_widgets import GpuWorkerStatus
 
 STYLE = """
@@ -1014,23 +1014,8 @@ class MainWindow(QMainWindow):
             self.queue.setItem(i, 4, size_item)
             requests = [r for r in api_activity if r["job"] == row["id"]]
             lines = [row["detail"]]
-            groups = {}
-            for request in requests:
-                groups.setdefault((request.get("profile_name", "API"), request["model"]), []).append(request)
-            for (name, model), active in groups.items():
-                running = sum(r.get("phase", "request") == "request" for r in active)
-                limit = min(r.get("effective_limit", r.get("configured_limit", 0)) for r in active)
-                configured = max(r.get("configured_limit", 0) for r in active)
-                rpm = max(r.get("rpm_limit", 0) for r in active)
-                rpm_used = max(r.get("rpm_used", 0) for r in active)
-                longest = max(int(time.monotonic()-r["started"]) for r in active)
-                quota = f" · RPM {rpm_used}/{rpm}" if rpm else ""
-                lines.append(f"{name}：请求 {running} · 等待 {len(active)-running} · 并发 {limit}/{configured}{quota} · {longest}秒")
-            if self.scheduler.translator.stats(row["id"])["queued"] and hasattr(self.scheduler.client, "quota_snapshot"):
-                for quota in self.scheduler.client.quota_snapshot(Settings.from_dict(json.loads(row["config"]))):
-                    if quota["rpm_wait_seconds"] > 0 and not quota["retry_seconds"]:
-                        wait = int(quota["rpm_wait_seconds"]+.999)
-                        lines.append(f"{quota['name']}：RPM节流 · {wait}秒后可发送 · {quota['rpm_used']}/{quota['rpm_limit']} RPM")
+            quotas = self.scheduler.client.quota_snapshot(Settings.from_dict(json.loads(row["config"]))) if hasattr(self.scheduler.client, "quota_snapshot") else []
+            lines.extend(provider_detail_lines(row, requests, quotas, self.scheduler.translator.stats(row["id"])["queued"]))
             notices = []
             warning = False
             for name, status_row in api_provider_records(row):
@@ -1041,7 +1026,6 @@ class MainWindow(QMainWindow):
                 if limited and notice and not row["state"].startswith("完成"):
                     warnings.append((name+"：" if name else "")+notice)
                     warning = True
-            lines.extend(notices)
             if not notices and requests:
                 last_error = next((r["last_error"] for r in reversed(requests) if r.get("last_error")), "")
                 if last_error:
@@ -1050,11 +1034,12 @@ class MainWindow(QMainWindow):
                 warnings.append(row["detail"])
                 warning = True
             detail = QTableWidgetItem("\n".join(lines))
-            detail.setToolTip("\n".join(lines)+"\n限流可能来自并发、请求频率或token配额。RPM为本进程最近60秒已占用的请求预算，含重试；其他应用的用量无法统计。"+("\n旧版历史限流次数未记录。" if row.get("api_partial") else ""))
+            detail.setToolTip("\n".join(lines)+"\n429次数按当前任务和配置累计；同端点/凭据的冷却、并发与RPM在任务之间共享。\n限流可能来自并发、请求频率或token配额。RPM为本进程最近60秒已占用的请求预算，含重试；其他应用的用量无法统计。"+("\n旧版历史限流次数未记录。" if row.get("api_partial") else ""))
             if warning:
                 detail.setForeground(QColor("#995126"))
             self.queue.setItem(i, 5, detail)
-            self.queue.setRowHeight(i, max(86, min(220, 24+18*len(lines))))
+            wrapped = self.queue.fontMetrics().boundingRect(0, 0, max(120, self.queue.columnWidth(5)-24), 10000, Qt.TextWordWrap, "\n".join(lines)).height()
+            self.queue.setRowHeight(i, max(86, min(440, 24+wrapped)))
             if row["id"] in selected_ids:
                 self.queue.selectionModel().select(self.queue.model().index(i, 0), QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
         self.queue.blockSignals(False)
