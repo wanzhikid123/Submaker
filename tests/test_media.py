@@ -21,7 +21,7 @@ def test_audio_and_chapters_survive_burn_without_duplicate_soft_subtitles(tmp_pa
     metadata.write_text(";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=2000\ntitle=Part 1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=2000\nEND=4000\ntitle=Part 2\n")
     command=["ffmpeg","-v","error","-f","lavfi","-i","color=c=navy:s=320x240:r=25:d=4","-f","lavfi","-i","sine=frequency=400:duration=4","-itsoffset","0.4","-f","lavfi","-i","sine=frequency=800:duration=4","-i",str(old_sub),"-f","ffmetadata","-i",str(metadata),"-map","0:v","-map","1:a","-map","2:a","-map","3:s","-map_metadata","4","-map_chapters","4","-c:v","libx264","-c:a","aac","-c:s","mov_text",str(source)]
     subprocess.run(command,check=True,capture_output=True)
-    settings=Settings(gpus=[0],audio_stream=2,encoding="quality",decoding="software")
+    settings=Settings(output_mode="burn", gpus=[0],audio_stream=2,encoding="quality",decoding="software")
     info=probe(source,settings)
     task={"job":"test","ffmpeg":settings.ffmpeg,"source":str(source),"audio_index":2,"decode_start":0,"decode_end":1}
     samples=decode_window(task,threading.Semaphore(1),{})
@@ -44,7 +44,7 @@ def test_static_hdr10_and_mastering_metadata_are_preserved(tmp_path):
     source=tmp_path/"hdr.mkv"
     parameters="pools=2:frame-threads=1:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400:hdr10=1"
     subprocess.run(["ffmpeg","-v","error","-f","lavfi","-i","color=c=navy:s=320x240:r=25:d=2","-f","lavfi","-i","sine=frequency=400:duration=2","-c:v","libx265","-pix_fmt","yuv420p10le","-color_primaries","bt2020","-color_trc","smpte2084","-colorspace","bt2020nc","-x265-params",parameters,"-c:a","aac",str(source)],check=True,capture_output=True)
-    settings=Settings(gpus=[0],encoding="quality",decoding="hardware" if shutil.which("nvidia-smi") else "software")
+    settings=Settings(output_mode="burn", gpus=[0],encoding="quality",decoding="hardware" if shutil.which("nvidia-smi") else "software")
     info=probe(source,settings)
     assert any(s.get("side_data_type")=="Mastering display metadata" for s in info["video"]["side_data_list"])
     target=tmp_path/"target.srt"
@@ -64,7 +64,7 @@ def test_real_gpu_decode_subtitle_render_and_nvenc_output(tmp_path, monkeypatch,
         pytest.skip("NVIDIA GPU not available")
     source = tmp_path / "gpu-source.mp4"
     subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=navy:s=640x360:r=25:d=2", "-f", "lavfi", "-i", "sine=frequency=400:duration=2", "-c:v", "libx264", "-c:a", "aac", str(source)], check=True, capture_output=True)
-    settings = Settings(gpus=[gpu], video_gpu=gpu, video_codec=codec, encoder_preset=preset)
+    settings = Settings(output_mode="burn", gpus=[gpu], video_gpu=gpu, video_codec=codec, encoder_preset=preset)
     info = probe(source, settings)
     output = tmp_path / "result.mkv"
     from submaker import media

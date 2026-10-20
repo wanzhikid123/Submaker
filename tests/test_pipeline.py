@@ -13,7 +13,7 @@ from submaker.store import Store, fingerprint
 
 
 @pytest.mark.skipif(not shutil.which("ffmpeg"), reason="FFmpeg not available")
-@pytest.mark.parametrize("failure", ["none", "title", "translate", "repair", "review_batch", "segment", "segment_fallback"])
+@pytest.mark.parametrize("failure", ["none", "soft", "burn_mp4", "title", "translate", "repair", "review_batch", "segment", "segment_fallback"])
 def test_streaming_translation_review_repair_and_real_burn(tmp_path, monkeypatch, failure):
     source = tmp_path / "original.mp4"
     subprocess.run(["ffmpeg","-v","error","-f","lavfi","-i","color=c=navy:s=640x360:r=25:d=3","-f","lavfi","-i","sine=frequency=400:duration=3","-c:v","libx264","-c:a","aac","-shortest",str(source)],check=True)
@@ -75,7 +75,9 @@ def test_streaming_translation_review_repair_and_real_burn(tmp_path, monkeypatch
     model = tmp_path / "model"
     model.mkdir()
     (model / "model.bin").touch()
-    settings = Settings(model_path=str(model), output_dir=str(tmp_path/"out"), gpus=[0], encoding="quality", decoding="software")
+    settings = Settings(model_path=str(model), output_dir=str(tmp_path/"out"), gpus=[0], encoding="quality", decoding="software",
+                        full_context_enabled=True, review_enabled=True,
+                        output_mode="soft" if failure == "soft" else "burn", output_container="mp4" if failure == "burn_mp4" else "mkv")
     if failure.startswith("segment"):
         if not shutil.which("nvidia-smi"):
             pytest.skip("GPU export required")
@@ -95,7 +97,7 @@ def test_streaming_translation_review_repair_and_real_burn(tmp_path, monkeypatch
     deadline = time.monotonic()+40
     while scheduler.active and time.monotonic()<deadline:
         time.sleep(0.1)
-    if failure not in ("none", "segment", "segment_fallback"):
+    if failure not in ("none", "soft", "burn_mp4", "segment", "segment_fallback"):
         assert store.jobs()[0]["state"] == "等待处理"
         assert store.get(ident,"chunk:0") is not None  # Translation outage must not abort local ASR.
         translations_before = sequence.count("translate") + sequence.count("repair")
@@ -116,6 +118,12 @@ def test_streaming_translation_review_repair_and_real_burn(tmp_path, monkeypatch
     if failure == "segment_fallback":
         assert sequence.count("segment_fallback") == 1
     assert Path(row["output"]).exists()
+    assert Path(row["output"]).suffix == (".mp4" if failure == "burn_mp4" else ".mkv")
+    from submaker.media import probe
+    exported = probe(row["output"], settings)
+    assert sum(s["codec_type"] == "subtitle" for s in exported["streams"]) == (1 if failure == "soft" else 0)
+    if failure == "soft":
+        assert exported["video"]["codec_name"] == "h264"
     assert not list((tmp_path/"out").rglob("*.srt"))
     assert not list((tmp_path/"out").rglob("*.ass"))
     assert not list((tmp_path/"out").glob(".submaker-*"))

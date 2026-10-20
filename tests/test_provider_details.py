@@ -3,6 +3,8 @@ import json
 import os
 import time
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication, QProgressBar
@@ -16,7 +18,7 @@ from submaker.telemetry import provider_detail_lines
 
 
 def settings_and_row():
-    settings = Settings(translate=Profile(name="ChatGPT", url="http://localhost/chat", model="chat", concurrency=1, rpm=3), translators=[Profile(name="Gemini", url="http://localhost/gemini", model="gemini", concurrency=5, rpm=10, key_id="gemini"), Profile(name="OpenRouter", url="http://localhost/router", model="router", concurrency=2, rpm=10, key_id="router")])
+    settings = Settings(full_context_enabled=True, review_enabled=True, translate=Profile(name="ChatGPT", url="http://localhost/chat", model="chat", concurrency=1, rpm=3), translators=[Profile(name="Gemini", url="http://localhost/gemini", model="gemini", concurrency=5, rpm=10, key_id="gemini"), Profile(name="OpenRouter", url="http://localhost/router", model="router", concurrency=2, rpm=10, key_id="router")])
     return settings, {"id": "fixture", "state": "处理中", "config": json.dumps(settings.as_dict()), "api_providers": []}
 
 
@@ -164,6 +166,36 @@ def test_pool_switching_retains_details_and_429_counts_but_only_final_failure_ra
         window.on_event("error", {"job": job, "error": error})
         assert not window.api_banner.isHidden()
         assert all(p.name in window.api_banner.text() for p in settings.translation_profiles())
+    finally:
+        window.close()
+        window.store.close()
+
+
+@pytest.mark.parametrize("stage", ["烧录字幕", "分段编码", "软字幕封装"])
+def test_export_bar_uses_stage_percentage_and_terminal_status_overrides_it(tmp_path, monkeypatch, stage):
+    settings, _ = settings_and_row()
+    monkeypatch.setattr(Settings, "load", classmethod(lambda cls: settings))
+    monkeypatch.setattr("submaker.gui.Store", lambda: Store(tmp_path/"jobs.sqlite"))
+    window = MainWindow()
+    try:
+        source = tmp_path/"fixture.mp4"
+        source.write_bytes(b"fixture")
+        job = window.store.add(source, settings)
+        window.media_info[job] = {"error": "fixture"}
+        window.store.update(job, "处理中", stage)
+        for fraction, percent in ((0, 0), (.12, 12), (.58, 58), (.999, 99), (1, 100)):
+            window.on_event("progress", {"job": job, "stage": stage, "progress": .8492, "stage_progress": fraction})
+            window.refresh()
+            bar = window.queue.cellWidget(0, 2).findChild(QProgressBar)
+            assert bar.format() == stage+f" {percent}/100%"
+            assert bar.value() == percent  # Actual export progress, not overall pipeline's 84%.
+        for state in ("暂停中", "已暂停", "等待处理", "完成"):
+            window.store.update(job, state, "fixture")
+            window.refresh()
+            bar = window.queue.cellWidget(0, 2).findChild(QProgressBar)
+            assert bar.format() == state
+            if state == "完成":
+                assert bar.value() == 100
     finally:
         window.close()
         window.store.close()

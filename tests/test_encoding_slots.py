@@ -116,7 +116,7 @@ def test_idle_resource_changes_resize_both_video_executor_and_local_gate(tmp_pat
         after = scheduler.client.limits.for_profile(updated.local_profile("translate"))
         assert after is not before and after.limit == 1
         assert scheduler.client.limits.for_profile(updated.local_profile("review")) is after
-        assert scheduler.encoding_slots.limit == 2 and scheduler.executor._max_workers == 6
+        assert scheduler.encoding_slots.limit == 2 and scheduler.executor._max_workers == 12
     finally:
         scheduler.shutdown()
         store.close()

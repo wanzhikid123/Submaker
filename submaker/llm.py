@@ -340,9 +340,15 @@ class Client:
         state = gate.snapshot()
         self.status({"job": JOB_CONTEXT.get(), "profile_id": profile_tag(profile), "profile_name": profile.name, "event": event, "code": code, "message": message, "attempt": attempt, "pool_failover": pool_failover, "configured_limit": profile.concurrency, **state, "retry_at": time.time()+state["retry_seconds"] if state["retry_seconds"] else 0, "rpm_ready_at": time.time()+state["rpm_wait_seconds"] if state["rpm_wait_seconds"] else 0})
 
-    def reset_faults(self):
+    def reset_faults(self, profiles=None):
         with self.fault_lock:
-            self.faults.clear()
+            if profiles is None:
+                self.faults.clear()
+            else:
+                for profile in profiles:
+                    base = profile.url.strip().rstrip("/")
+                    url = base if base.endswith("/chat/completions") else base+"/chat/completions"
+                    self.faults.pop((url, profile.model, profile.effort, profile.key_id), None)
 
     @staticmethod
     def _post(url, body, headers, timeout, cancel):

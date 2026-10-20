@@ -24,7 +24,7 @@ def test_parallel_decode_preserves_every_decoded_frame_and_video_parameters(tmp_
     if codec == "h264":
         source_command += ["-vf", "setpts='PTS+if(gte(N,30),0.5/TB,0)'", "-fps_mode", "passthrough"]
     subprocess.run([*source_command, "-c:a", "aac", str(source)], check=True, capture_output=True)
-    settings = Settings(gpus=[0, 1], threads=16, video_gpu=gpu, video_codec=codec, encoder_preset="p7", video_quality=24, video_concurrency=1)
+    settings = Settings(output_mode="burn", gpus=[0, 1], threads=16, video_gpu=gpu, video_codec=codec, encoder_preset="p7", video_quality=24, video_concurrency=1)
     info = media.probe(source, settings)
     baseline, improved = tmp_path/"baseline.mkv", tmp_path/"improved.mkv"
     default_budget = media.video_thread_budget

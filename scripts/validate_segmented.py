@@ -45,7 +45,7 @@ def main():
         subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=1280x720:r=30:d=120",
                         "-f", "lavfi", "-i", "sine=frequency=500:duration=120", "-c:v", "h264_nvenc", "-gpu", "0", "-preset", "p3", "-cq", "20",
                         "-c:a", "aac", str(source)], check=True)
-    settings = Settings(gpus=[0, 1] if options.dual_gpu else [0], video_gpu=-1 if options.dual_gpu else 0,
+    settings = Settings(output_mode="burn", gpus=[0, 1] if options.dual_gpu else [0], video_gpu=-1 if options.dual_gpu else 0,
                         video_concurrency=6 if options.dual_gpu else 3, video_quality=24,
                         video_decode_threads=1, video_filter_threads=1 if options.dual_gpu else 2)
     info = probe(source, settings)

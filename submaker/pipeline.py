@@ -16,7 +16,7 @@ from .dispatch import FairTranslationExecutor
 from .encoding_slots import EncodingSlots
 from .config import MAX_VIDEO_ENCODERS, Settings
 from .llm import APIError, Client, Limits, JOB_CONTEXT, profile_identity, profile_tag, translation_key, translation_unit_keys
-from .media import Cancelled, burn, check, estimate_output, format_cues, legal_stem, preserve_filename_tokens, probe, reserve_output, temporary_subtitles, video_plan
+from .media import Cancelled, burn, check, estimate_output, format_cues, legal_stem, output_plan, preserve_filename_tokens, probe, reserve_output, temporary_subtitles, video_plan
 from .store import fingerprint
 
 
@@ -35,6 +35,19 @@ def split_rows(rows, max_chars=18000, max_count=40):
         size += n
     if batch:
         yield batch
+
+
+def model_identity(settings):
+    weights = Path(settings.model_path, "model.bin")
+    stat = weights.stat() if weights.exists() else None
+    return {"path": str(weights.resolve()), "size": stat.st_size if stat else None, "mtime": stat.st_mtime_ns if stat else None}
+
+
+def recognition_key(job, settings):
+    """Only ASR inputs invalidate prepared text; changing APIs/output does not."""
+    value = {key: getattr(settings, key) for key in ("source", "preset", "chunk_seconds", "overlap", "audio_stream", "glossary")}
+    value.update(fingerprint=job["fingerprint"], model=model_identity(settings))
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
 class Scheduler:
@@ -66,11 +79,21 @@ class Scheduler:
                     with gate.condition:
                         gate.limit = min(gate.limit, 2)
         self.pool = None
-        self.executor = cf.ThreadPoolExecutor(max_workers=max(1, settings.in_flight), thread_name_prefix="video")
+        # Export workers no longer consume the pre-export pipeline's admission
+        # slots. Leave bounded thread capacity for both stages to overlap.
+        self.executor = cf.ThreadPoolExecutor(max_workers=max(1, settings.in_flight) + MAX_VIDEO_ENCODERS, thread_name_prefix="video")
+        self.prefetch_executor = cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper-prefetch")
         self.translator = FairTranslationExecutor(max_workers=max(16, settings.translation_parallelism()))
         self.encoding_slots = EncodingSlots(settings.encoding_limit())
+        self.remux_slot = threading.Semaphore(1)
         self.active = {}
+        self.recognizing = set()
+        self.prefetching = set()
+        self.exporting = set()
         self.deleting = set()
+        self.pausing = set()
+        self.requested = set()
+        self.pending_retries = {}
         self.previews = {}
         self.lock = threading.RLock()
         self.accepting = False
@@ -94,60 +117,173 @@ class Scheduler:
         return slot, dataclasses.replace(settings, video_gpu=slot.gpu if hardware else settings.video_gpu,
                                          video_concurrency=self.encoding_slots.limit)
 
-    def emit(self, job, stage, progress=0, detail=""):
+    def emit(self, job, stage, progress=0, detail="", *, stage_progress=None):
+        if job in self.pausing:
+            return
         now = time.monotonic()
         last_time, last_stage = self.last_persist.get(job, (0, ""))
         if now-last_time >= 2 or stage != last_stage:
             self.store.update(job, "处理中", detail or stage)
             self.last_persist[job] = (now, stage)
-        self.callback("progress", {"job": job, "stage": stage, "progress": progress, "detail": detail})
+        event = {"job": job, "stage": stage, "progress": progress, "detail": detail}
+        if stage_progress is not None:
+            event["stage_progress"] = min(1, max(0, stage_progress))
+        self.callback("progress", event)
 
     def start(self):
-        if isinstance(self.client, Client):
-            self.client.local_only = self.settings.llm_mode == "local"
-        self.accepting = True
-        for row in self.store.jobs():
-            if row["state"] in ("等待恢复", "已暂停") and row["id"] not in self.active:
-                self.store.update(row["id"], "排队中", "等待继续")
-        self._pump()
+        with self.lock:
+            # Bind the queue to the settings at Start, not at Add. Persist the
+            # same snapshot the workers and provider details will read. Active
+            # workers already own their snapshot and must never change mid-run.
+            config = json.dumps(self.settings.as_dict(), ensure_ascii=False)
+            with self.store.lock, self.store.db:
+                for row in self.store.jobs():
+                    if row["id"] in self.active or row["state"] not in ("排队中", "等待恢复", "已暂停"):
+                        continue
+                    detail = row["detail"] if row["state"] == "排队中" else "等待继续"
+                    self.store.db.execute("UPDATE jobs SET config=?,state='排队中',detail=? WHERE id=?",
+                                          (config, detail, row["id"]))
+            if isinstance(self.client, Client):
+                self.client.local_only = self.settings.llm_mode == "local"
+            self.accepting = True
+            self._pump()
 
     def _pump(self):
         with self.lock:
-            for row in self.store.jobs():
-                if not self.accepting or len(self.active) >= self.settings.in_flight:
+            if not self.accepting and not self.requested:
+                return
+            rows = self.store.jobs()
+            rows.sort(key=lambda row: row["id"] not in self.requested)
+            for row in rows:
+                if len(self.active.keys() - self.exporting - self.prefetching) >= self.settings.in_flight:
+                    break
+                if row["id"] in self.pausing or not (self.accepting or row["id"] in self.requested):
+                    continue
+                # An earlier film already being prepared keeps its FIFO place.
+                if row["id"] in self.prefetching:
                     break
                 if row["state"] != "排队中" or row["id"] in self.active:
                     continue
                 cancel = threading.Event()
                 self.active[row["id"]] = cancel
+                self.recognizing.add(row["id"])
+                self.requested.discard(row["id"])
                 self.executor.submit(self._run, row, cancel)
+            # Use the existing Whisper models only when foreground recognition
+            # has finished. One extra video can use both GPU workers; when its
+            # text is saved, this lane moves on without buying any LLM requests.
+            if self.prefetching or self.recognizing:
+                return
+            for row in rows:
+                if row["id"] in self.pausing or not (self.accepting or row["id"] in self.requested):
+                    continue
+                if row["state"] != "排队中" or row["id"] in self.active:
+                    continue
+                settings = Settings.from_dict(json.loads(row["config"]))
+                if self._prepared(row, settings):
+                    continue
+                cancel = threading.Event()
+                self.active[row["id"]] = cancel
+                self.prefetching.add(row["id"])
+                self.recognizing.add(row["id"])
+                self.prefetch_executor.submit(self._run, row, cancel, True)
+                break
+
+    def _prepared(self, job, settings):
+        saved = self.store.get(job["id"], "whisper_prepared")
+        return bool(saved and saved.get("key") == recognition_key(job, settings))
+
+    def _recognition_done(self, ident):
+        with self.lock:
+            self.recognizing.discard(ident)
+            self._pump()
+
+    def _export_started(self, ident):
+        with self.lock:
+            if ident in self.active and ident not in self.exporting:
+                self.exporting.add(ident)
+                self._pump()
 
     def retry(self, ident, settings=None, title=None):
+        return self.retry_many([ident], settings, title)
+
+    def retry_many(self, jobs, settings=None, title=None):
+        """Retry only these jobs, without turning automatic queue admission on."""
         with self.lock:
-            if ident in self.active:
-                return
+            selected = set(jobs)
+            rows = [row for row in self.store.jobs() if row["id"] in selected and row["id"] not in self.deleting and row["state"] != "删除中"]
+            if not rows:
+                return 0
+            if settings is not None:
+                settings = Settings.from_dict(settings.as_dict())
+                self._configure(settings)
+            for row in rows:
+                ident = row["id"]
+                if ident in self.active:
+                    # Let the old worker and its requests finish cancellation
+                    # before installing new settings or scheduling another run.
+                    self.pending_retries[ident] = (settings, title)
+                    self.pausing.add(ident)
+                    self.store.update(ident, "暂停中", "正在停止选中任务并保存恢复点，随后按当前设置重试")
+                    self.active[ident].set()
+                else:
+                    self._queue_retry(ident, settings, title)
+            self._pump()
+        self.callback("refresh", {})
+        return len(rows)
+
+    def _queue_retry(self, ident, settings, title):
+        # Called under the scheduler lock, only after any old worker is gone.
+        saved = next((row for row in self.store.jobs() if row["id"] == ident), None)
+        if not saved:
+            return
         if settings is not None:
             with self.store.lock, self.store.db:
-                saved = self.store.db.execute("SELECT config FROM jobs WHERE id=?", (ident,)).fetchone()
                 value = settings.as_dict()
-                if saved:
-                    value["repair_via_review"] = Settings.from_dict(json.loads(saved[0])).repair_via_review
+                value["repair_via_review"] = Settings.from_dict(json.loads(saved["config"])).repair_via_review
                 self.store.db.execute("UPDATE jobs SET config=? WHERE id=?", (json.dumps(value, ensure_ascii=False), ident))
+        else:
+            settings = Settings.from_dict(json.loads(saved["config"]))
         if title:
             self.store.put(ident, "manual_title", legal_stem(title))
-        if hasattr(self.client, "reset_faults"):
+        if isinstance(self.client, Client):
+            self.client.reset_faults([*settings.translation_profiles(), settings.review_profile()])
+        elif hasattr(self.client, "reset_faults"):
             self.client.reset_faults()
-        self.store.update(ident, "排队中", "等待恢复")
-        self.accepting = True
-        self._pump()
+        self.pausing.discard(ident)
+        self.requested.add(ident)
+        self.store.update(ident, "排队中", "等待按当前设置重试")
+        self.callback("progress", {"job": ident, "stage": "等待重试", "progress": 0, "detail": "等待处理名额，复用有效恢复点"})
 
     def pause(self, ident=None):
-        if ident is None:
-            self.accepting = False
         with self.lock:
-            for key, cancel in self.active.items():
-                if ident is None or ident == key:
-                    cancel.set()
+            if ident is None:
+                self.accepting = False
+                self.requested.clear()
+                self.pending_retries.clear()
+                jobs = set(self.active)
+            else:
+                jobs = {ident} if isinstance(ident, str) else set(ident)
+            if not jobs:
+                return 0
+            count = 0
+            for row in self.store.jobs():
+                key = row["id"]
+                if key not in jobs or key in self.deleting or row["state"].startswith("完成") or row["state"] == "删除中":
+                    continue
+                self.requested.discard(key)
+                self.pending_retries.pop(key, None)
+                if key in self.active:
+                    self.pausing.add(key)
+                    self.store.update(key, "暂停中", "正在停止选中任务并保存文字恢复点")
+                    self.active[key].set()
+                elif row["state"] in ("排队中", "等待恢复"):
+                    self.store.update(key, "已暂停", "任务已暂停，等待重试或开始队列")
+                else:
+                    continue
+                count += 1
+        self.callback("refresh", {})
+        return count
 
     def delete(self, jobs=None):
         """Cancel active work before removing its records, never remove media files."""
@@ -157,6 +293,9 @@ class Scheduler:
                 jobs = [row["id"] for row in self.store.jobs()]
             jobs = set(jobs)
             for ident in jobs:
+                self.requested.discard(ident)
+                self.pending_retries.pop(ident, None)
+                self.pausing.discard(ident)
                 if ident in self.active:
                     self.deleting.add(ident)
                     self.store.update(ident, "删除中", "正在停止任务并清理运行缓存")
@@ -192,6 +331,9 @@ class Scheduler:
             resources = ("llm_mode", "local_model", "gpus", "threads", "ram_gib", "model_path", "in_flight", "video_concurrency", "video_segmented", "video_decode_threads", "video_filter_threads")
             if any(getattr(settings, key) != getattr(self.settings, key) for key in resources):
                 raise RuntimeError("请先暂停并等待在途任务停止，再更改 GPU、CPU 线程或模型/编码并发")
+            # API changes apply to the next queue start; active jobs keep their
+            # own serialized settings. Do not leave the scheduler on old APIs.
+            self.settings = settings
             return
         effective = settings.execution_settings()
         if self.pool and any(getattr(self.pool.settings, key) != getattr(effective, key) for key in ("gpus", "threads", "ram_gib", "model_path")):
@@ -205,11 +347,11 @@ class Scheduler:
                 self.client.local_runtime.stop()
         if settings.in_flight != self.settings.in_flight:
             self.executor.shutdown(wait=False, cancel_futures=True)
-            self.executor = cf.ThreadPoolExecutor(max_workers=max(1, settings.in_flight), thread_name_prefix="video")
+            self.executor = cf.ThreadPoolExecutor(max_workers=max(1, settings.in_flight) + MAX_VIDEO_ENCODERS, thread_name_prefix="video")
         self.encoding_slots.set_limit(effective.video_concurrency)
         self.settings = settings
 
-    def _run(self, job, cancel):
+    def _run(self, job, cancel, prefetch=False):
         ident = job["id"]
         job_context = JOB_CONTEXT.set(ident)
         settings = Settings.from_dict(json.loads(job["config"])).execution_settings()
@@ -220,7 +362,7 @@ class Scheduler:
                 raise APIError("任务保存的模型模式与当前模式不同；请使用当前设置重试，避免调用未选择的接口")
             if settings.llm_mode == "local" and settings.local_model != self.settings.local_model:
                 raise APIError("任务保存的本地模型资源与当前配置不同；请使用当前设置重试，避免切换在途模型或占用保留的 GPU")
-            if settings.llm_mode == "local":
+            if settings.llm_mode == "local" and not prefetch:
                 from .local_llm import verify_model
                 self.emit(ident, "检查本地模型", .005)
                 verify_model(settings.local_model, cancel)
@@ -228,7 +370,7 @@ class Scheduler:
                 raise RuntimeError("源文件已经改变，拒绝复用旧恢复点；请重新添加视频")
             self.emit(ident, "媒体预检", 0.01)
             info = probe(job["source"], settings)
-            video_plan(info, settings)
+            output_plan(info, settings)
             directory = Path(settings.output_dir) if settings.output_dir else Path(job["source"]).parent
             directory.mkdir(exist_ok=True, parents=True)
             if shutil.disk_usage(directory).free < max(1024**3, estimate_output(info, settings)["high"] * 1.1):
@@ -244,7 +386,7 @@ class Scheduler:
             pending_limit = max(128, min(8192, settings.ram_gib * 1024))
 
             def submit_translation(batch):
-                if not batch:
+                if prefetch or not batch:
                     return
                 if not settings.translation_profiles():
                     return
@@ -311,7 +453,7 @@ class Scheduler:
                         translated_count = len(valid_ids.intersection(translations))
                         self.previews[ident] = [{**s, "translation": translations.get(s["id"], "")} for s in segments]
                         self.callback("preview", {"job": ident, "recognized": len(segments), "translated": translated_count})
-                        if asr_finished[0]:
+                        if asr_finished[0] and not prefetch:
                             stats = self.translator.stats(ident)
                             wait = int(now-last_translation[0])
                             detail = f"识别已完成 · 已译 {translated_count}/{len(valid_ids)} 段 · 请求执行/等待接口 {stats['running']}，排队 {stats['queued']}"
@@ -324,9 +466,7 @@ class Scheduler:
                     cancel.wait(0.1)
 
             # ASR cache identity includes language, model and segmentation settings.
-            weights = Path(settings.model_path, "model.bin")
-            model_identity = {"path": str(weights.resolve()), "size": weights.stat().st_size if weights.exists() else None, "mtime": weights.stat().st_mtime_ns if weights.exists() else None}
-            asr_contract = {"source": settings.source, "model": model_identity, "preset": settings.preset, "chunk": settings.chunk_seconds, "overlap": settings.overlap, "audio": info["audio"]["index"], "glossary": settings.glossary}
+            asr_contract = {"source": settings.source, "model": model_identity(settings), "preset": settings.preset, "chunk": settings.chunk_seconds, "overlap": settings.overlap, "audio": info["audio"]["index"], "glossary": settings.glossary}
             old_contract = self.store.get(ident, "asr_contract")
             if old_contract != asr_contract:
                 self.store.clean(ident)
@@ -336,12 +476,16 @@ class Scheduler:
             events = None
             count = math.ceil(info["duration"] / settings.chunk_seconds)
             chunks = list(range(count))
-            completed = set()
-            for i in chunks:
-                saved = self.store.get(ident, f"chunk:{i}")
-                if saved is not None:
-                    completed.add(i)
-                    segments.extend(saved)
+            prepared_segments = self.store.get(ident, "final_segments") if self._prepared(job, settings) else None
+            completed = set(chunks) if prepared_segments is not None else set()
+            if prepared_segments is not None:
+                segments = prepared_segments
+            else:
+                for i in chunks:
+                    saved = self.store.get(ident, f"chunk:{i}")
+                    if saved is not None:
+                        completed.add(i)
+                        segments.extend(saved)
             segments.sort(key=lambda s: s["start"])
             for batch in split_rows(segments, max_chars=6000, max_count=20):
                 submit_translation(batch)
@@ -375,7 +519,7 @@ class Scheduler:
                 if pool.fatal:
                     raise RuntimeError(pool.fatal)
                 # Small submissions allow other videos to enter the shared GPU queue.
-                parallel_windows = (1 if len(self.active) > 1 else len(settings.gpus)) if first_dispatch else (1 if len(getattr(pool, "queues", {ident: events})) > 1 else len(settings.gpus))
+                parallel_windows = (1 if len(self.recognizing) > 1 else len(settings.gpus)) if first_dispatch else (1 if len(getattr(pool, "queues", {ident: events})) > 1 else len(settings.gpus))
                 if settings.source == "auto" and not detected_language:
                     parallel_windows = 1
                 while remaining and len(in_progress) < parallel_windows:
@@ -409,7 +553,8 @@ class Scheduler:
                         collect(True)
                     else:
                         collect()
-                    self.emit(ident, "识别 / 翻译并行", 0.05 + 0.50 * (len(completed) + min(1, s["end"] / settings.chunk_seconds % 1)) / count, f"已识别 {len(segments)} 段 / 已翻译 {len(translations)} 段")
+                    detail = f"已识别 {len(segments)} 段 · 仅预识别，尚未调用翻译接口" if prefetch else f"已识别 {len(segments)} 段 / 已翻译 {len(translations)} 段"
+                    self.emit(ident, "Whisper 预处理" if prefetch else "识别 / 翻译并行", 0.05 + 0.50 * (len(completed) + min(1, s["end"] / settings.chunk_seconds % 1)) / count, detail)
                 elif kind == "done":
                     flush_live(i, force=True)
                     self.store.put(ident, f"chunk:{i}", in_progress.pop(i))
@@ -431,7 +576,7 @@ class Scheduler:
 
             # Re-read small boundary regions with both sides present; replace provisional units.
             boundaries = [i * settings.chunk_seconds for i in range(1, count)]
-            suspicious = [b for b in boundaries if any(abs(s["start"]-b)<2.5 or abs(s["end"]-b)<2.5 for s in segments)]
+            suspicious = [] if prepared_segments is not None else [b for b in boundaries if any(abs(s["start"]-b)<2.5 or abs(s["end"]-b)<2.5 for s in segments)]
             for n, boundary in enumerate(suspicious):
                 saved = self.store.get(ident, f"boundary:{boundary}")
                 if saved is None:
@@ -474,12 +619,21 @@ class Scheduler:
                             segments.sort(key=lambda s: s["start"])
                             for batch in split_rows(saved, max_count=8):
                                 submit_translation(batch)
-                self.emit(ident, "边界复核", 0.56, f"连接处 {n+1}/{len(suspicious)}")
-            collect(True)
+                self.emit(ident, "预处理边界复核" if prefetch else "边界复核", 0.56, f"连接处 {n+1}/{len(suspicious)}")
             self.store.put(ident, "final_segments", segments)
-            self.store.put(ident, "final_translations", translations)
+            self.store.put(ident, "whisper_prepared", {"key": recognition_key(job, settings), "segments": len(segments)})
             if pool is not None:
                 pool.unregister(ident)
+            if prefetch:
+                check(cancel)
+                self.store.update(ident, "排队中", f"Whisper 已完成 · {len(segments)} 段 · 等待翻译名额，尚未调用翻译接口")
+                self.previews.pop(ident, None)  # Prepared queues retain text checkpoints, not full RAM previews.
+                self.callback("progress", {"job": ident, "stage": "等待翻译名额", "progress": .55,
+                                           "detail": "Whisper 已完成；前序任务开始编码或封装后进入翻译"})
+                return
+            self._recognition_done(ident)
+            collect(True)
+            self.store.put(ident, "final_translations", translations)
 
             if not settings.translation_profiles():
                 raise APIError("本地识别已完成并保存文字；请填写 API 地址和模型，保存后重试将复用识别结果")
@@ -489,11 +643,16 @@ class Scheduler:
             rows = [{"id": s["id"], "source": s["text"], "translation": translations[s["id"]]} for s in segments]
             local = settings.llm_mode == "local"
             brief_chars = max(500, min(4000, (settings.local_model.context-settings.local_review.max_tokens-2500)//3)) if local else 18000
+            if not settings.full_context_enabled:
+                brief_chars = 0
             audit_chars = max(1000, min(6000, (settings.local_model.context-settings.local_review.max_tokens-2500-brief_chars)//2)) if local else 18000
             def review_hash(content):
-                return hashlib.sha256(json.dumps({"rows": content, "profile": profile_identity(settings.review or settings.translate), "glossary": settings.glossary, "target": settings.target}, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-            review_identity = review_hash(rows)
-            cached_review = self.store.get(ident, "review-once-v1:" + review_identity)
+                value = {"rows": content, "profile": profile_identity(settings.review or settings.translate), "glossary": settings.glossary, "target": settings.target}
+                if not settings.full_context_enabled:
+                    value["full_context_enabled"] = False
+                return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            review_identity = review_hash(rows) if settings.review_enabled else ""
+            cached_review = self.store.get(ident, "review-once-v1:" + review_identity) if settings.review_enabled else None
             def audit_call(kind, content, call):
                 key = "audit-v2:" + kind + ":" + review_hash(content)
                 cached = self.store.get(ident, key)
@@ -503,79 +662,90 @@ class Scheduler:
                 self.store.put(ident, key, {"value": value})
                 return value
 
+            def prepare_context():
+                if not settings.full_context_enabled:
+                    return ""
+                briefs = []
+                brief_batches = list(split_rows(rows, max_chars=audit_chars if local else 24000, max_count=20 if local else 100))
+                for i, batch in enumerate(brief_batches):
+                    briefs.append(audit_call("brief", batch, lambda: self.client.brief(settings, batch, cancel))[:2000])
+                    self.emit(ident, "整理全片上下文", 0.60, f"上下文 {i+1}/{len(brief_batches)}")
+                for reduction in range(8):
+                    if len("\n".join(briefs)) <= brief_chars:
+                        break
+                    before = len("\n".join(briefs))
+                    summary_cap = max(120, min(1000, brief_chars//2)) if local else 2000
+                    briefs = [audit_call("brief", batch, lambda: self.client.brief(settings, batch, cancel))[:summary_cap] for batch in split_rows([{"brief": b} for b in briefs], max_chars=audit_chars if local else 18000, max_count=4 if local else 8)]
+                    if len("\n".join(briefs)) >= before:
+                        raise APIError("全片上下文未能压缩到模型容量内；已保留恢复点，请增加上下文长度")
+                if len("\n".join(briefs)) > brief_chars:
+                    raise APIError("全片上下文超过模型容量；已保留恢复点，请增加上下文长度")
+                brief = "\n".join(briefs)
+                self.store.put(ident, "full_context", brief)
+                return brief
+
             issues = []
-            if cached_review:
-                translations.update(cached_review["translations"])
-                issues = cached_review["issues"]
-            else:
-                self.emit(ident, "全片审校", 0.60, "整理全片上下文，逐段覆盖检查")
-                state_key = "audit-once-state-v1:" + review_identity
-                audit_state = self.store.get(ident, state_key)
-                legacy_review = self.store.get(ident, "review:" + review_identity)
-                if audit_state is None and legacy_review:
-                    audit_state = {"brief": "", "translations": legacy_review["translations"], "issues": legacy_review["issues"], "repaired": []}
-                if audit_state:
-                    translations.update(audit_state["translations"])
-                    brief = audit_state["brief"]
-                    issues = audit_state["issues"]
+            if settings.review_enabled:
+                if cached_review:
+                    translations.update(cached_review["translations"])
+                    issues = cached_review["issues"]
                 else:
-                    briefs = []
-                    brief_batches = list(split_rows(rows, max_chars=audit_chars if local else 24000, max_count=20 if local else 100))
-                    for i, batch in enumerate(brief_batches):
-                        briefs.append(audit_call("brief", batch, lambda: self.client.brief(settings, batch, cancel))[:2000])
-                        self.emit(ident, "整理全片上下文", 0.60, f"上下文 {i+1}/{len(brief_batches)}")
-                    for reduction in range(8):
-                        if len("\n".join(briefs)) <= brief_chars:
-                            break
-                        before = len("\n".join(briefs))
-                        summary_cap = max(120, min(1000, brief_chars//2)) if local else 2000
-                        briefs = [audit_call("brief", batch, lambda: self.client.brief(settings, batch, cancel))[:summary_cap] for batch in split_rows([{"brief": b} for b in briefs], max_chars=audit_chars if local else 18000, max_count=4 if local else 8)]
-                        if len("\n".join(briefs)) >= before:
-                            raise APIError("全片上下文未能压缩到模型容量内；已保留恢复点，请增加上下文长度")
-                    if len("\n".join(briefs)) > brief_chars:
-                        raise APIError("全片上下文超过模型容量；已保留恢复点，请增加上下文长度")
-                    brief = "\n".join(briefs)
-                    issues = []
-                    batches = list(split_rows(rows, max_chars=audit_chars, max_count=12 if local else 40))
-                    self.emit(ident, f"全片审校 0/{len(batches)}", 0.60, "逐段覆盖检查，等待首批审校结果")
-                    for i, batch in enumerate(batches):
-                        check(cancel)
-                        # Include neighbors to audit sentence/terminology continuity across windows.
-                        offset = rows.index(batch[0])
-                        context_rows = rows[max(0, offset-3): min(len(rows), offset+len(batch)+3)]
-                        issues.extend(audit_call("review", {"round": 0, "rows": context_rows, "brief": brief}, lambda: self.client.review(settings, context_rows, brief, cancel)))
-                        self.emit(ident, f"全片审校 {i+1}/{len(batches)}", 0.60 + 0.12 * (i+1)/len(batches), f"一次审校 · 覆盖 {i+1}/{len(batches)}")
-                    # Neighboring windows may report the same issue more than once.
-                    issues = list({json.dumps(x, sort_keys=True, ensure_ascii=False): x for x in issues}.values())
-                    audit_state = {"brief": brief, "translations": translations, "issues": issues, "repaired": []}
-                self.store.put(ident, state_key, audit_state)
-                affected = {j for x in issues for j in x["ids"]}
-                repaired = set(audit_state["repaired"])
-                repair_settings = settings.repair_settings()
-                repair_batches = list(split_rows([s for s in segments if s["id"] in affected-repaired], max_count=8))
-                for i, batch in enumerate(repair_batches):
-                    batch_ids = {s["id"] for s in batch}
-                    relevant = [x for x in issues if batch_ids.intersection(x["ids"])]
-                    instruction = json.dumps(relevant, ensure_ascii=False)
-                    begin = max(0, segments.index(batch[0])-4)
-                    end = min(len(segments), segments.index(batch[-1])+5)
-                    context = {"global_brief": brief, "neighbors": [{"source": s["text"], "translation": translations.get(s["id"], "")} for s in segments[begin:end]]}
-                    repair_rows = [{"id": s["id"], "text": s["text"]} for s in batch]
-                    fixed = audit_call("repair-once", {"translation_policy": translation_key(repair_settings, [], None), "source": settings.source, "prompt": settings.prompt, "rows": repair_rows, "context": context, "instruction": instruction}, lambda: self.client.translate(repair_settings, repair_rows, context, cancel, instruction))
-                    translations.update(fixed)
-                    repaired.update(batch_ids)
-                    audit_state.update(translations=translations, repaired=sorted(repaired))
+                    self.emit(ident, "全片审校", 0.60, "逐段覆盖检查，发现问题后自动修正")
+                    state_key = "audit-once-state-v1:" + review_identity
+                    audit_state = self.store.get(ident, state_key)
+                    legacy_review = self.store.get(ident, "review:" + review_identity)
+                    if audit_state is None and legacy_review:
+                        audit_state = {"brief": "", "translations": legacy_review["translations"], "issues": legacy_review["issues"], "repaired": []}
+                    if audit_state:
+                        translations.update(audit_state["translations"])
+                        brief = audit_state["brief"]
+                        issues = audit_state["issues"]
+                    else:
+                        brief = prepare_context()
+                        issues = []
+                        batches = list(split_rows(rows, max_chars=audit_chars, max_count=12 if local else 40))
+                        self.emit(ident, f"全片审校 0/{len(batches)}", 0.60, "逐段覆盖检查，等待首批审校结果")
+                        for i, batch in enumerate(batches):
+                            check(cancel)
+                            # Include neighbors to audit sentence/terminology continuity across windows.
+                            offset = rows.index(batch[0])
+                            context_rows = rows[max(0, offset-3): min(len(rows), offset+len(batch)+3)]
+                            issues.extend(audit_call("review", {"round": 0, "rows": context_rows, "brief": brief}, lambda: self.client.review(settings, context_rows, brief, cancel)))
+                            self.emit(ident, f"全片审校 {i+1}/{len(batches)}", 0.60 + 0.12 * (i+1)/len(batches), f"一次审校 · 覆盖 {i+1}/{len(batches)}")
+                        # Neighboring windows may report the same issue more than once.
+                        issues = list({json.dumps(x, sort_keys=True, ensure_ascii=False): x for x in issues}.values())
+                        audit_state = {"brief": brief, "translations": translations, "issues": issues, "repaired": []}
                     self.store.put(ident, state_key, audit_state)
-                    self.emit(ident, "自动修正", 0.72 + 0.06 * (i+1)/len(repair_batches), f"修正 {i+1}/{len(repair_batches)} · 完成后直接导出")
-                rows = [{"id": s["id"], "source": s["text"], "translation": translations[s["id"]]} for s in segments]
-                self.store.put(ident, "review-once-v1:" + review_identity, {"translations": translations, "issues": issues})
-                self.store.put(ident, "review-once-v1:" + review_hash(rows), {"translations": translations, "issues": issues})
-            for s in segments:
-                r = {"id": s["id"], "text": s["text"], "start": s["start"], "end": s["end"]}
-                self.store.put(ident, "unit:" + translation_key(settings, [r], None), {"text": translations[s["id"]], "request": "full-film-reviewed"})
+                    affected = {j for x in issues for j in x["ids"]}
+                    repaired = set(audit_state["repaired"])
+                    repair_settings = settings.repair_settings()
+                    repair_batches = list(split_rows([s for s in segments if s["id"] in affected-repaired], max_count=8))
+                    for i, batch in enumerate(repair_batches):
+                        batch_ids = {s["id"] for s in batch}
+                        relevant = [x for x in issues if batch_ids.intersection(x["ids"])]
+                        instruction = json.dumps(relevant, ensure_ascii=False)
+                        begin = max(0, segments.index(batch[0])-4)
+                        end = min(len(segments), segments.index(batch[-1])+5)
+                        context = {"global_brief": brief, "neighbors": [{"source": s["text"], "translation": translations.get(s["id"], "")} for s in segments[begin:end]]}
+                        repair_rows = [{"id": s["id"], "text": s["text"]} for s in batch]
+                        fixed = audit_call("repair-once", {"translation_policy": translation_key(repair_settings, [], None), "source": settings.source, "prompt": settings.prompt, "rows": repair_rows, "context": context, "instruction": instruction}, lambda: self.client.translate(repair_settings, repair_rows, context, cancel, instruction))
+                        translations.update(fixed)
+                        repaired.update(batch_ids)
+                        audit_state.update(translations=translations, repaired=sorted(repaired))
+                        self.store.put(ident, state_key, audit_state)
+                        self.emit(ident, "自动修正", 0.72 + 0.06 * (i+1)/len(repair_batches), f"修正 {i+1}/{len(repair_batches)} · 完成后直接导出")
+                    rows = [{"id": s["id"], "source": s["text"], "translation": translations[s["id"]]} for s in segments]
+                    self.store.put(ident, "review-once-v1:" + review_identity, {"translations": translations, "issues": issues})
+                    self.store.put(ident, "review-once-v1:" + review_hash(rows), {"translations": translations, "issues": issues})
+                for s in segments:
+                    r = {"id": s["id"], "text": s["text"], "start": s["start"], "end": s["end"]}
+                    self.store.put(ident, "unit:" + translation_key(settings, [r], None), {"text": translations[s["id"]], "request": "full-film-reviewed"})
+            elif settings.full_context_enabled:
+                prepare_context()
             self.store.put(ident, "final_translations", translations)
             self.store.put(ident, "issues", issues)
             self.previews[ident] = [{**s, "translation": translations.get(s["id"], "")} for s in segments]
+            audit_note = f"一次审校，已自动处理 {len(issues)} 项修订" if settings.review_enabled else "已整理全片上下文；未启用审校" if settings.full_context_enabled else "未启用全片上下文整理与审校"
 
             self.emit(ident, "翻译文件名", 0.80)
             title_key = "title:" + hashlib.sha256(json.dumps({"profile": profile_identity(settings.review_profile()), "target": settings.target, "stem": Path(job["source"]).stem}, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
@@ -584,32 +754,42 @@ class Scheduler:
                 title = preserve_filename_tokens(Path(job["source"]).stem, self.client.title(settings, Path(job["source"]).stem, cancel))
                 self.store.put(ident, title_key, title)
             cues = format_cues(segments, translations, settings.bilingual, settings.target)
-            output, lock = reserve_output(directory, title)
+            output, lock = reserve_output(directory, title, settings.output_extension())
             reserved = (output, lock)
+            if settings.output_mode == "soft":
+                self._remux(job, info, settings, cancel, cues, output, directory)
+                lock.unlink(missing_ok=True)
+                self.store.update(ident, "完成", f"{len(cues)} 条软字幕；原视频与音轨直接复制；{audit_note}；运行缓存已清理", output)
+                self.store.clean(ident)
+                self.previews.pop(ident, None)
+                self.callback("complete", {"job": ident, "output": str(output), "issues": len(issues)})
+                return
             self.emit(ident, "等待烧录", 0.82)
             from .segmented import TimelineError, burn_segmented, enabled as segment_enabled
             segmented_done = False
             if segment_enabled(info, settings):
                 segment_progress = [0.0]
                 def wait_segment(status):
-                    self.emit(ident, "分段编码", .83+.16*segment_progress[0], f"分段等待编码槽 · 正在编码 {status['active']}/{status['limit']} 路")
+                    self.emit(ident, "分段编码", .83+.16*segment_progress[0], f"分段等待编码槽 · 正在编码 {status['active']}/{status['limit']} 路", stage_progress=segment_progress[0])
                 def progress_segment(value):
-                    segment_progress[0] = max(segment_progress[0], value)
-                    self.emit(ident, "分段编码", .83+.16*segment_progress[0], f"分段NVENC · 按序写入成品 {segment_progress[0]*100:.1f}%")
+                    segment_progress[0] = min(1, max(segment_progress[0], value))
+                    self.emit(ident, "分段编码", .83+.16*segment_progress[0], f"分段NVENC · 按序写入成品 {segment_progress[0]*100:.1f}%", stage_progress=segment_progress[0])
                 def segment_worker(event, gpu, index, total):
+                    if event == "encoding_started":
+                        self._export_started(ident)
                     self.callback("gpu", {"type": event, "gpu": gpu, "job": ident, "worker": index})
-                self.emit(ident, "分段编码", .83, "检查完整视频时间轴 · 准备并行烧录")
+                self.emit(ident, "分段编码", .83, "检查完整视频时间轴 · 准备并行烧录", stage_progress=0)
                 try:
-                    with temporary_subtitles(directory, cues) as subtitle:
+                    with temporary_subtitles(directory, cues, settings) as subtitle:
                         burn_segmented(job["source"], output, subtitle, info, settings, cancel, self.encoding_slots, ident,
                             progress_segment, segment_worker, wait_segment)
                     segmented_done = True
                 except TimelineError:
-                    self.emit(ident, "烧录字幕", .83, "分段时间轴不适合拼接，改用单路GPU保持同步")
+                    self.emit(ident, "烧录字幕", .83, "分段时间轴不适合拼接，改用单路GPU保持同步", stage_progress=0)
             if not segmented_done:
                 self._burn_single(job, info, settings, cancel, cues, output, directory)
             lock.unlink(missing_ok=True)
-            self.store.update(ident, "完成", f"{len(cues)} 条字幕；一次审校，已自动处理 {len(issues)} 项修订；运行缓存已清理", output)
+            self.store.update(ident, "完成", f"{len(cues)} 条字幕；{audit_note}；运行缓存已清理", output)
             self.store.clean(ident)
             self.previews.pop(ident, None)
             self.callback("complete", {"job": ident, "output": str(output), "issues": len(issues)})
@@ -638,11 +818,22 @@ class Scheduler:
                 reserved[1].unlink(missing_ok=True)
             with self.lock:
                 self.active.pop(ident, None)
+                self.recognizing.discard(ident)
+                self.prefetching.discard(ident)
+                self.exporting.discard(ident)
                 self.last_persist.pop(ident, None)
                 if ident in self.deleting:
                     self.store.delete([ident])
                     self.deleting.discard(ident)
                     self.previews.pop(ident, None)
+                    self.pending_retries.pop(ident, None)
+                    self.requested.discard(ident)
+                elif ident in self.pending_retries:
+                    self._queue_retry(ident, *self.pending_retries.pop(ident))
+                elif ident in self.pausing:
+                    with self.store.lock, self.store.db:
+                        self.store.db.execute("UPDATE jobs SET state='已暂停',detail='文字恢复点已保存，等待继续' WHERE id=? AND state IN ('处理中','排队中','暂停中')", (ident,))
+                self.pausing.discard(ident)
             self.callback("refresh", {})
             JOB_CONTEXT.reset(job_context)
             self._pump()
@@ -654,23 +845,45 @@ class Scheduler:
         plan = None
         try:
             plan = video_plan(info, video_settings)
+            self._export_started(ident)
             if plan["encode"] or plan["decode"]:
                 self.callback("gpu", {"type": "encoding_started", "gpu": plan["gpu"], "job": ident, "encoding": plan["encode"]})
             mode = "NVDEC 解码" if plan["decode"] else "CPU 解码"
             mode += f" / {video_settings.video_codec.upper()} NVENC" if plan["encode"] else " / CPU 编码" + ("（保留静态HDR）" if plan["hdr"] else "")
-            self.emit(ident, "烧录字幕", 0.83)
-            with temporary_subtitles(directory, cues) as subtitle:
-                burn(job["source"], output, subtitle, info, video_settings, cancel, lambda p: self.emit(ident, "烧录字幕", 0.83 + 0.16 * min(1, max(0, p)), f"{mode} · 编码 {p*100:.1f}%"))
+            self.emit(ident, "烧录字幕", 0.83, stage_progress=0)
+            def progress(value):
+                value = min(1, max(0, value))
+                self.emit(ident, "烧录字幕", .83+.16*value, f"{mode} · 编码 {value*100:.1f}%", stage_progress=value)
+            with temporary_subtitles(directory, cues, settings) as subtitle:
+                burn(job["source"], output, subtitle, info, video_settings, cancel, progress)
         finally:
             if plan and (plan["encode"] or plan["decode"]):
                 self.callback("gpu", {"type": "encoding_done", "gpu": plan["gpu"], "job": ident})
             encoder.release()
+
+    def _remux(self, job, info, settings, cancel, cues, output, directory):
+        from .remux import mux_subtitles
+        self.emit(job["id"], "等待封装", .82, "等待软字幕封装 · 原视频和音轨直接复制")
+        while not self.remux_slot.acquire(timeout=.2):
+            check(cancel)
+        try:
+            check(cancel)
+            self._export_started(job["id"])
+            self.emit(job["id"], "软字幕封装", .83, "复制原视频和音轨 · 字幕默认显示，可在播放器中关闭", stage_progress=0)
+            def progress(value):
+                value = min(1, max(0, value))
+                self.emit(job["id"], "软字幕封装", .83+.16*value, "校验完整音视频时间轴" if value >= 1 else f"软字幕封装 · 直接复制 {value*100:.1f}%", stage_progress=value)
+            with temporary_subtitles(directory, cues, settings) as subtitle:
+                mux_subtitles(job["source"], output, subtitle, info, settings, cancel, progress)
+        finally:
+            self.remux_slot.release()
 
     def shutdown(self):
         self.pause()
         if self.pool:
             self.pool.shutdown()
         self.executor.shutdown(wait=False, cancel_futures=True)
+        self.prefetch_executor.shutdown(wait=False, cancel_futures=True)
         self.translator.shutdown(wait=False, cancel_futures=True)
         if isinstance(self.client, Client) and self.client.local_runtime:
             self.client.local_runtime.stop()

@@ -75,14 +75,14 @@ def test_task_delete_cancels_active_work_and_never_deletes_media(tmp_path,monkey
 
 def test_estimate_tracks_codec_quality_and_bitrate_without_claiming_exact_size():
     info=media_info()
-    compact=estimate_output(info,Settings())
-    avc=estimate_output(info,Settings(video_codec="h264"))
-    sharp=estimate_output(info,Settings(video_quality=20))
+    compact=estimate_output(info,Settings(output_mode="burn"))
+    avc=estimate_output(info,Settings(output_mode="burn", video_codec="h264"))
+    sharp=estimate_output(info,Settings(output_mode="burn", video_quality=20))
     assert compact["bytes"] < avc["bytes"]
     assert compact["bytes"] < sharp["bytes"]
     for value in (compact,avc,sharp):
         assert value["low"] < value["bytes"] <= value["high"]
-    fixed=estimate_output(info,Settings(size_mode="bitrate",video_bitrate_kbps=1000))
+    fixed=estimate_output(info,Settings(output_mode="burn", size_mode="bitrate",video_bitrate_kbps=1000))
     assert abs(fixed["bytes"]-3600*(1000000+128000)/8*1.02)<1
     assert compact["high"] < 3600*2128000/8
 

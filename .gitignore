@@ -1,5 +1,7 @@
 # Local configuration, credentials, task history and recovery data
 /data/
+# Personal filename notes and subtitle exports can contain source-video names.
+/日语文件名.txt
 .env
 .env.*
 !.env.example
@@ -63,8 +65,13 @@ _netrc
 *.aac
 *.srt
 *.ass
+*.ssa
+*.sub
+*.idx
+*.sup
 *.vtt
 *.partial*
+*.reserve
 .submaker-*/
 
 # Local reports can contain endpoint metadata, paths and task information.
@@ -118,6 +125,8 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
 .cache/
 .huggingface/

@@ -14,7 +14,7 @@ from submaker.config import Settings
 from submaker.encoding_slots import EncodingSlots
 
 
-def fixture(root, ten=False):
+def fixture(root, ten=False, attach=True):
     source = root/"source.mkv"
     original = root/"original.srt"
     media.write_srt(original, [{"start": 0, "end": 7, "text": "old subtitle"}])
@@ -29,14 +29,17 @@ def fixture(root, ten=False):
             "-c:v", "libx265" if ten else "libx264", "-pix_fmt", "yuv420p10le" if ten else "yuv420p", "-threads", "2"]
     if ten:
         args += ["-x265-params", "pools=2:frame-threads=1"]
-    args += ["-c:a", "aac", "-c:s", "srt", "-attach", str(attachment), "-metadata:s:t:0", "mimetype=text/plain", str(source)]
+    args += ["-c:a", "aac", "-c:s", "srt"]
+    if attach:
+        args += ["-attach", str(attachment), "-metadata:s:t:0", "mimetype=text/plain"]
+    args += [str(source)]
     subprocess.run(args, check=True, capture_output=True)
     return source
 
 
 def test_segmentation_is_optional_gpu_only_and_skips_short_or_single_slot_jobs():
     video = {"codec_name": "h264", "pix_fmt": "yuv420p"}
-    settings = Settings()
+    settings = Settings(output_mode="burn")
     info = {"duration": 60, "video": video}
     assert segmented.enabled(info, settings)
     for changed in (dataclasses.replace(settings, video_segmented=False), dataclasses.replace(settings, video_concurrency=1), dataclasses.replace(settings, encoding="quality")):
@@ -45,19 +48,19 @@ def test_segmentation_is_optional_gpu_only_and_skips_short_or_single_slot_jobs()
 
 
 @pytest.mark.skipif(not shutil.which("nvidia-smi"), reason="V100 GPU required")
-@pytest.mark.parametrize("codec,ten", [("hevc", False), ("h264", False), ("hevc", True)])
-def test_real_segmented_gpu_vfr_subtitle_cuts_audio_chapters_and_attachments(tmp_path, codec, ten):
+@pytest.mark.parametrize("codec,ten,container", [("hevc", False, "mkv"), ("h264", False, "mkv"), ("hevc", True, "mkv"), ("hevc", False, "mp4"), ("h264", False, "mp4")])
+def test_real_segmented_gpu_vfr_subtitle_cuts_audio_chapters_and_attachments(tmp_path, codec, ten, container):
     import numpy as np
-    source = fixture(tmp_path, ten)
-    settings = Settings(gpus=[0], video_gpu=0, video_codec=codec, video_quality=24, size_mode="quality")
+    source = fixture(tmp_path, ten, attach=container=="mkv")
+    settings = Settings(output_mode="burn", output_container=container, gpus=[0], video_gpu=0, video_codec=codec, video_quality=24, size_mode="quality")
     info = media.probe(source, settings)
     pool = EncodingSlots(3)
     events = []
-    output = tmp_path/"result.mkv"
+    output = tmp_path/("result."+container)
     with media.temporary_subtitles(tmp_path, [{"start": .2, "end": 6.8, "text": "跨分段边界字幕"}]) as subtitle:
         segmented.burn_segmented(source, output, subtitle, info, settings, threading.Event(), pool, "test",
                                  on_worker=lambda kind, gpu, index, total: events.append((kind, gpu, index, pool.snapshot()["active"])))
-        baseline = tmp_path/"single.mkv"
+        baseline = tmp_path/("single."+container)
         media.burn(source, baseline, subtitle, info, settings, threading.Event(), lambda _: None)
     # A fine transport clock must never silently change NVENC's bitrate or
     # quality. Compare the same output frames with the original single path.
@@ -75,9 +78,15 @@ def test_real_segmented_gpu_vfr_subtitle_cuts_audio_chapters_and_attachments(tmp
     origin = float(info["format"].get("start_time") or 0)
     for old, new in zip(info["chapters"], result["chapters"]):
         assert old["tags"]["title"] == new["tags"]["title"]
-        assert all(abs(float(new[k])-float(old[k])+origin) < .002 for k in ("start_time", "end_time"))
+        for key in ("start_time", "end_time"):
+            # MP4 chapter tracks cover a leading gap from zero; subsequent
+            # boundaries still retain the source chapter times plus offset.
+            if container == "mp4" and old is info["chapters"][0] and key == "start_time":
+                assert float(new[key]) == 0
+            else:
+                assert abs(float(new[key])-float(old[key])+origin) < .002
     assert not any(s["codec_type"] == "subtitle" for s in result["streams"])
-    assert sum(s["codec_type"] == "attachment" for s in result["streams"]) == 1
+    assert sum(s["codec_type"] == "attachment" for s in result["streams"]) == (1 if container=="mkv" else 0)
     original_times = segmented.frame_times(source, info["video"]["index"], settings, None, float(info["format"].get("start_time") or 0))
     output_times = segmented.frame_times(output, 0, settings, None)
     assert len(original_times) == len(output_times) == 210
@@ -99,7 +108,7 @@ def test_real_segmented_gpu_vfr_subtitle_cuts_audio_chapters_and_attachments(tmp
 @pytest.mark.skipif(not shutil.which("nvidia-smi"), reason="V100 GPU required")
 def test_segment_cancellation_cleans_processes_buffers_and_all_encoding_slots(tmp_path):
     source = fixture(tmp_path)
-    settings = Settings(gpus=[0], video_gpu=0)
+    settings = Settings(output_mode="burn", gpus=[0], video_gpu=0)
     info = media.probe(source, settings)
     pool, cancel = EncodingSlots(3), threading.Event()
     started = []
@@ -117,7 +126,7 @@ def test_segment_cancellation_cleans_processes_buffers_and_all_encoding_slots(tm
 
 def test_failed_segment_encoder_releases_every_slot_and_removes_partial(tmp_path, monkeypatch):
     source = fixture(tmp_path)
-    settings = Settings(gpus=[0], video_gpu=0)
+    settings = Settings(output_mode="burn", gpus=[0], video_gpu=0)
     info = media.probe(source, settings)
     pool = EncodingSlots(3)
     original = segmented.burn_command
@@ -137,7 +146,7 @@ def test_failed_segment_encoder_releases_every_slot_and_removes_partial(tmp_path
 @pytest.mark.parametrize("devices,limit", [([0], 3), ([0, 1], 6)])
 def test_two_movies_share_slots_and_out_of_order_segments_do_not_deadlock(tmp_path, monkeypatch, devices, limit):
     source = fixture(tmp_path)
-    settings = Settings(gpus=devices, video_gpu=-1, video_concurrency=limit)
+    settings = Settings(output_mode="burn", gpus=devices, video_gpu=-1, video_concurrency=limit)
     info = media.probe(source, settings)
     pool, lock, peaks = EncodingSlots(limit), threading.Lock(), []
     original = segmented.burn_command
@@ -169,7 +178,7 @@ def test_two_movies_share_slots_and_out_of_order_segments_do_not_deadlock(tmp_pa
 @pytest.mark.parametrize("codec", ["hevc", "h264"])
 def test_single_movie_uses_six_segments_on_both_gpus_and_preserves_timeline(tmp_path, codec):
     source = fixture(tmp_path)
-    settings = Settings(gpus=[0, 1], video_concurrency=6, video_codec=codec)
+    settings = Settings(output_mode="burn", gpus=[0, 1], video_concurrency=6, video_codec=codec)
     info = media.probe(source, settings)
     pool = EncodingSlots(6)
     wave = threading.Barrier(6)

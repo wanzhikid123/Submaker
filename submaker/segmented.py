@@ -13,7 +13,7 @@ import time
 
 import av
 
-from .media import CREATE_NO_WINDOW, Cancelled, bitrate_plan, burn_command, check, validate_burn, video_plan
+from .media import CREATE_NO_WINDOW, Cancelled, bitrate_plan, burn_command, check, container_options, partial_output, validate_burn, video_plan
 
 
 class TimelineError(RuntimeError):
@@ -21,7 +21,7 @@ class TimelineError(RuntimeError):
 
 
 def enabled(info, settings):
-    return settings.video_segmented and settings.video_concurrency > 1 and info["duration"] >= 30 and video_plan(info, settings)["encode"]
+    return settings.output_mode == "burn" and settings.video_segmented and settings.video_concurrency > 1 and info["duration"] >= 30 and video_plan(info, settings)["encode"]
 
 
 class Control:
@@ -145,7 +145,7 @@ def mux_command(source, partial, info, settings):
         args += ["-map", f"1:{stream['index']}", f"-map_metadata:s:{index}", f"1:s:{stream['index']}"]
     args += ["-map_metadata", "1", "-map_metadata:s:v:0", f"1:s:{info['video']['index']}",
              "-map_chapters", "1", "-c", "copy", "-avoid_negative_ts", "disabled", "-max_muxing_queue_size", "4096",
-             "-progress", "pipe:1", "-nostats", str(partial)]
+             *container_options(settings), "-progress", "pipe:1", "-nostats", str(partial)]
     return args
 
 
@@ -162,7 +162,7 @@ def burn_segmented(source, output, subtitle, info, settings, cancel, slots, owne
         raise TimelineError("无法确定分段编码的有效帧率") from None
     delay = max((b-a for a,b in zip(expected, expected[4:])), default=float(1/fps))+.01 if settings.video_codec == "h264" else 0
     chunks, budget = windows(expected, info, settings)
-    partial = output.with_suffix(".partial.mkv")
+    partial = partial_output(output)
     control = Control(cancel)
     ready = queue.Queue(maxsize=slots.limit)
     workers, leases = [], []

@@ -503,6 +503,7 @@ def test_local_pipeline_real_loopback_transport_and_video_export(tmp_path, monke
     whisper.mkdir()
     (whisper/"model.bin").touch()
     settings = Settings(llm_mode="local", model_path=str(whisper), output_dir=str(tmp_path/"out"),
+                        full_context_enabled=True, review_enabled=True,
                         local_review=LocalRole("high", 2048), encoding="quality", decoding="software")
     local_weights = tmp_path/"local.gguf"
     local_weights.write_bytes(b"GGUFsynthetic-model")

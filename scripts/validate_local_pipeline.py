@@ -20,7 +20,8 @@ def main():
         response.raise_for_status()
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=navy:s=640x360:r=25",
                         "-i", "pipe:0", "-t", "12", "-shortest", "-c:v", "libx264", "-c:a", "aac", str(source)], input=response.content, check=True)
-    settings = Settings(llm_mode="local", source="en", chunk_seconds=30, output_dir=str(directory/"output"),
+    settings = Settings(output_mode="burn", llm_mode="local", source="en", chunk_seconds=30, output_dir=str(directory/"output"),
+                        full_context_enabled=True, review_enabled=True,
                         local_translate=LocalRole("none", 2048), local_review=LocalRole("none", 2048))
     store = Store(directory/"jobs.sqlite")  # Isolated test database; never opens production tasks.
     store.delete([row["id"] for row in store.jobs()])

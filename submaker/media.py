@@ -41,7 +41,7 @@ def probe(path, settings):
     if settings.audio_stream >= 0 and audio is None:
         raise RuntimeError("指定的音轨不存在，请修改任务音轨设置")
     audio = audio or max(matches or audios, key=lambda a: a.get("disposition", {}).get("default", 0))
-    if videos[0].get("color_transfer") in ("smpte2084", "arib-std-b67"):
+    if settings.output_mode == "burn" and videos[0].get("color_transfer") in ("smpte2084", "arib-std-b67"):
         first = subprocess.run([settings.ffprobe,"-v","error","-select_streams",str(videos[0]["index"]),"-read_intervals","%+#1","-show_frames","-show_entries","frame=side_data_list","-of","json",str(path)],capture_output=True,creationflags=CREATE_NO_WINDOW,timeout=45)
         if first.returncode == 0:
             frames = json.loads(first.stdout).get("frames", [])
@@ -118,8 +118,10 @@ def write_srt(path, cues):
     Path(path).write_text(text, encoding="utf-8-sig")
 
 
-def write_ass(path, cues):
+def write_ass(path, cues, font="Microsoft YaHei", font_size=24):
     header = "[Script Info]\nScriptType: v4.00+\nPlayResX: 384\nPlayResY: 288\nWrapStyle: 0\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Microsoft YaHei,24,&H00FFFFFF,&H000000FF,&H00111111,&H00000000,0,0,0,0,100,100,0,0,1,1.6,0.5,2,10,10,24,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    font = re.sub(r"[^\w \-]", "", font) or "Microsoft YaHei"
+    header = header.replace("Style: Default,Microsoft YaHei,24,", f"Style: Default,{font},{int(font_size)},")
     def clock(value):
         cs = max(0, round(value*100))
         return f"{cs//360000}:{cs//6000%60:02}:{cs//100%60:02}.{cs%100:02}"
@@ -131,7 +133,7 @@ def write_ass(path, cues):
 
 
 @contextmanager
-def temporary_subtitles(directory, cues):
+def temporary_subtitles(directory, cues, settings=None):
     directory = Path(directory).resolve()
     temporary = tempfile.TemporaryDirectory(prefix=".submaker-", dir=directory)
     location = Path(temporary.name).resolve()
@@ -139,7 +141,7 @@ def temporary_subtitles(directory, cues):
         if location.parent != directory or not location.name.startswith(".submaker-"):
             raise RuntimeError("字幕临时目录超出输出目录")
         subtitle = location / "captions.ass"
-        write_ass(subtitle, cues)
+        write_ass(subtitle, cues, settings.font, settings.font_size) if settings else write_ass(subtitle, cues)
         yield subtitle
     finally:
         if location.resolve().parent == directory and location.name.startswith(".submaker-"):
@@ -149,15 +151,17 @@ def temporary_subtitles(directory, cues):
 _output_lock = threading.Lock()
 
 
-def reserve_output(directory, title):
+def reserve_output(directory, title, extension="mkv"):
+    if extension not in ("mkv", "mp4"):
+        raise ValueError("不支持的输出容器")
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     stem = legal_stem(title)
     with _output_lock:
         for index in range(1, 10000):
             suffix = "" if index == 1 else f".v{index:03}"
-            video = directory / f"{stem}{suffix}.mkv"
-            lock = video.with_suffix(".reserve")
+            video = directory / f"{stem}{suffix}.{extension}"
+            lock = video.with_name(video.name+".reserve")
             if video.exists():
                 continue
             try:
@@ -199,6 +203,10 @@ def bitrate_plan(info, settings):
 
 
 def estimate_output(info, settings):
+    if settings.output_mode == "soft":
+        size = _positive(info.get("source_bytes"), _positive(info.get("format", {}).get("bit_rate"))*info["duration"]/8)
+        subtitle_bytes = min(2*1024**2, max(2048, info["duration"]*32))
+        return {"bytes": round(size*1.002+subtitle_bytes), "low": round(size*.98), "high": round(size*1.03+1024**2)}
     rates = bitrate_plan(info, settings)
     seconds = info["duration"]
     overhead = 1.02
@@ -222,6 +230,29 @@ def video_plan(info, settings):
     return {"decode": decode, "encode": settings.encoding == "hardware", "hdr": hdr, "ten": ten, "gpu": settings.video_gpu if settings.video_gpu >= 0 else settings.gpus[0]}
 
 
+def output_plan(info, settings):
+    extension = settings.output_extension()
+    if settings.output_mode == "burn":
+        video_plan(info, settings)
+        if extension == "mp4":
+            if any(s["codec_type"] == "attachment" for s in info["streams"]):
+                raise ValueError("MP4 无法保留原片附件，请选择 MKV 烧录，以保留原有字体等附件")
+            supported_audio = {"aac", "mp3", "ac3", "eac3", "alac", "flac", "opus"}
+            unsupported = [s.get("codec_name", "unknown") for s in info["streams"] if s["codec_type"] == "audio" and s.get("codec_name") not in supported_audio]
+            extra_video = [s.get("codec_name", "unknown") for s in info["streams"] if s["codec_type"] == "video" and s["index"] != info["video"]["index"] and s.get("codec_name") not in {"h264", "hevc", "av1", "mpeg4", "mjpeg", "png"}]
+            if unsupported or extra_video:
+                raise ValueError("MP4 无法直接保留这些原片轨道："+", ".join(unsupported+extra_video)+"；请选择 MKV，避免额外转码")
+    return extension
+
+
+def partial_output(output):
+    return output.with_name(output.stem+".partial"+output.suffix)
+
+
+def container_options(settings):
+    return ["-tag:v:0", "hvc1"] if settings.output_extension() == "mp4" and settings.video_codec == "hevc" else []
+
+
 def video_thread_budget(settings, plan):
     if not plan["encode"]:
         return {"decode": settings.video_decode_threads or 1, "filter": settings.video_filter_threads or 1}
@@ -236,7 +267,7 @@ def video_thread_budget(settings, plan):
 
 
 def burn_command(source, output, subtitle, info, settings, segment=None):
-    partial = output.with_suffix(".partial.mkv")
+    partial = partial_output(output)
     # CWD + a local relative path avoids Windows drive/colon filter escaping.
     relative = Path(os.path.relpath(subtitle, output.parent)).as_posix().replace("'", "'\\''").replace(":", "\\:").replace(",", "\\,").replace("[", "\\[").replace("]", "\\]")
     font = re.sub(r"[^\w \-]", "", settings.font)
@@ -310,7 +341,7 @@ def burn_command(source, output, subtitle, info, settings, segment=None):
         args += ["-enc_time_base:v:0", f"{rate.denominator}/{rate.numerator}", "-mpegts_copyts", "1", "-mpegts_flags", "+resend_headers+initial_discontinuity",
                  "-muxdelay", "0", "-muxpreload", "0", "-avoid_negative_ts", "disabled", "-progress", "pipe:2", "-nostats", "-f", "mpegts", "pipe:1"]
     else:
-        args += ["-max_muxing_queue_size", "4096", "-progress", "pipe:1", "-nostats", str(partial)]
+        args += [*container_options(settings), "-max_muxing_queue_size", "4096", "-progress", "pipe:1", "-nostats", str(partial)]
     return args
 
 
@@ -340,8 +371,13 @@ def validate_burn(partial, info, settings):
 
 
 def burn(source, output, subtitle, info, settings, cancel, on_progress):
-    partial = output.with_suffix(".partial.mkv")
     args = burn_command(source, output, subtitle, info, settings)
+    run_export(args, output, info, cancel, on_progress, lambda partial: validate_burn(partial, info, settings), "视频烧录")
+
+
+def run_export(args, output, info, cancel, on_progress, validate, label):
+    check(cancel)
+    partial = partial_output(output)
     # FFmpeg may emit a lot of errors: keep a bounded tail in RAM, never an intermediate video copy.
     p = subprocess.Popen(args, cwd=output.parent, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=CREATE_NO_WINDOW, text=True, encoding="utf-8", errors="replace")
     errors = []
@@ -375,11 +411,13 @@ def burn(source, output, subtitle, info, settings, cancel, on_progress):
         if p.returncode:
             if abort_reason:
                 raise RuntimeError(abort_reason[0])
-            raise RuntimeError("视频烧录失败：" + "".join(errors)[-3000:])
-        validate_burn(partial, info, settings)
+            raise RuntimeError(label+"失败：" + "".join(errors)[-3000:])
+        validate(partial)
+        check(cancel)
         if output.exists():
             raise RuntimeError("输出路径被其他程序占用，拒绝覆盖")
         os.rename(partial, output)
+        on_progress(1.0)
     finally:
         if p.poll() is None:
             p.kill()

@@ -453,7 +453,7 @@ class SettingsDialog(QDialog):
         tabs.addTab(self.translation_stack, "翻译设置")
         review_page = QWidget()
         review_layout = QVBoxLayout(review_page)
-        review_note = label("新任务的全片上下文、审校、自动修正和文件名翻译统一使用此接口及模型。已有任务保留其保存的修正方式。", "muted")
+        review_note = label("文件名翻译使用此接口；启用的全片上下文整理、审校和自动修正也共用此接口及模型。", "muted")
         review_note.setWordWrap(True)
         review_layout.addWidget(review_note)
         review_scroll = QScrollArea()
@@ -463,12 +463,37 @@ class SettingsDialog(QDialog):
         self.review_stack = QStackedWidget()
         self.review_stack.addWidget(review_page)
         self.review_stack.addWidget(self.local_review)
-        tabs.addTab(self.review_stack, "审校 / 文件名")
+        review_options = QWidget()
+        review_options_layout = QVBoxLayout(review_options)
+        self.full_context_enabled = QCheckBox("整理全片上下文（可选，默认关闭）")
+        self.full_context_enabled.setChecked(settings.full_context_enabled)
+        self.full_context_enabled.setToolTip("翻译完成后生成全片人物、术语与情节摘要，供审校及修正参考；关闭时不发出上下文整理请求。")
+        self.review_enabled = QCheckBox("全片审校并自动修正（可选，默认关闭）")
+        self.review_enabled.setChecked(settings.review_enabled)
+        self.review_enabled.setToolTip("翻译完成后审校一次并自动修正问题；无需人工确认。关闭时不发出审校或修正请求。")
+        review_options_layout.addWidget(self.full_context_enabled)
+        review_options_layout.addWidget(self.review_enabled)
+        options_note = label("两项均默认关闭。文件名仍会翻译；开启审校时可选择是否整理全片上下文。", "muted")
+        options_note.setWordWrap(True)
+        review_options_layout.addWidget(options_note)
+        review_options_layout.addWidget(self.review_stack, 1)
+        tabs.addTab(review_options, "审校 / 文件名")
         self.local_model_editor = LocalModelEditor(settings.local_model)
         tabs.addTab(self.local_model_editor, "本地模型 / GPU")
         video = QWidget()
         video_form = QFormLayout(video)
-        video_form.setSpacing(16)
+        self.video_form = video_form
+        video_form.setSpacing(12)
+        self.output_mode = QComboBox()
+        self.output_mode.addItem("软字幕封装 · 保留原画质（默认）", "soft")
+        self.output_mode.addItem("烧录字幕 · 重新编码视频", "burn")
+        self.output_mode.setCurrentIndex(max(0, self.output_mode.findData(settings.output_mode)))
+        self.output_container = QComboBox()
+        for caption, value in (("MKV", "mkv"), ("MP4", "mp4")):
+            self.output_container.addItem(caption, value)
+        self.output_container.setCurrentIndex(max(0, self.output_container.findData(settings.output_container)))
+        video_form.addRow("字幕输出方式", self.output_mode)
+        video_form.addRow("烧录视频容器", self.output_container)
         self.codec = QComboBox()
         self.codec.addItem("H.265 / HEVC · 紧凑体积（默认）", "hevc")
         self.codec.addItem("H.264 / AVC · 广泛兼容", "h264")
@@ -485,7 +510,6 @@ class SettingsDialog(QDialog):
         self.size_mode.setCurrentIndex(max(0, self.size_mode.findData(settings.size_mode)))
         self.video_bitrate = spin(settings.video_bitrate_kbps, 100, 200000, " kbps")
         self.video_bitrate.setEnabled(settings.size_mode == "bitrate")
-        self.size_mode.currentIndexChanged.connect(lambda: self.video_bitrate.setEnabled(self.size_mode.currentData() == "bitrate"))
         for caption, field in (("输出编码", self.codec), ("GPU 速度预设", self.encoder_speed), ("画面质量", self.video_quality), ("体积策略", self.size_mode), ("目标视频码率", self.video_bitrate)):
             video_form.addRow(caption, field)
         self.video_concurrency = spin(settings.video_concurrency, 1, 6, " 路")
@@ -506,7 +530,7 @@ class SettingsDialog(QDialog):
         self.encoding_note = label("", "muted")
         self.encoding_note.setWordWrap(True)
         video_form.addRow(self.encoding_note)
-        tabs.addTab(video, "视频编码")
+        tabs.addTab(video, "字幕与视频")
         general = QWidget()
         form = QFormLayout(general)
         form.setSpacing(12)
@@ -519,7 +543,7 @@ class SettingsDialog(QDialog):
         self.chunk.setToolTip("单窗口最大10分钟；识别句子会在窗口完成前送去翻译")
         self.ram = spin(settings.ram_gib, 1, 24, " GiB")
         self.inflight = spin(settings.in_flight, 1, 6)
-        self.inflight.setToolTip("默认 4 个。在途上限至少为 4 时，才能让 3 个视频编码的同时继续识别第 4 个视频。")
+        self.inflight.setToolTip("默认 4 个，限制编码前的识别、翻译和审校流水线。Whisper 空闲时额外预识别排队视频，不调用 LLM；前序视频开始编码或封装后释放名额，预识别视频再进入翻译。")
         self.audio = spin(settings.audio_stream, -1, 128)
         self.audio.setSpecialValueText("自动选择匹配源语言的默认音轨")
         self.encode = QComboBox()
@@ -557,7 +581,7 @@ class SettingsDialog(QDialog):
         pv.addWidget(self.glossary)
         tabs.addTab(prompts, "翻译与术语")
         outer.addWidget(tabs)
-        notice = label("新任务使用新配置，已有任务请“使用当前设置重试”。更改运行资源前请暂停并等待在途任务停止；空闲保存后生效。", "muted")
+        notice = label("点击“开始队列”时，排队及暂停任务使用当前设置；运行中任务保留启动配置。更改运行资源前请全选暂停并等待在途任务停止。", "muted")
         notice.setWordWrap(True)
         outer.addWidget(notice)
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
@@ -566,6 +590,9 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         outer.addWidget(buttons)
+        self.resources_locked = bool(parent and getattr(parent, "scheduler", None) and parent.scheduler.active)
+        self.output_mode.currentIndexChanged.connect(self.output_options_changed)
+        self.size_mode.currentIndexChanged.connect(self.output_options_changed)
         self.encode.currentIndexChanged.connect(self.encoding_capacity_changed)
         self.video_gpu.currentIndexChanged.connect(self.encoding_capacity_changed)
         self.llm_mode.currentIndexChanged.connect(self.mode_changed)
@@ -598,7 +625,24 @@ class SettingsDialog(QDialog):
         self.video_concurrency.setMaximum(capacity)
         self.video_concurrency.setValue(min(self.encoding_requested, capacity))
         self.video_concurrency.blockSignals(False)
-        self.encoding_note.setText(f"当前设备最多 {capacity} 路。双卡自动分配最多6路，每卡最多3路；本地模型保留专用卡，CPU兼容编码限1路。\n视频与分段共用名额，满额自动排队。内存按序合并，完整复制音轨并校验全部帧时间戳。\nCPU线程按每路生效，P7使用全分辨率双遍。")
+        self.output_options_changed()
+
+    def output_options_changed(self):
+        burn = self.output_mode.currentData() == "burn"
+        for widget in (self.output_container, self.codec, self.encoder_speed, self.video_quality, self.size_mode,
+                       self.video_bitrate, self.video_concurrency, self.video_segmented, self.video_decode_threads, self.video_filter_threads):
+            self.video_form.setRowVisible(widget, burn)
+        for widget in (self.output_container, self.codec, self.encoder_speed, self.video_quality,
+                       self.size_mode, self.encode, self.decode, self.video_gpu):
+            widget.setEnabled(burn)
+        self.video_bitrate.setEnabled(burn and self.size_mode.currentData() == "bitrate")
+        for widget in (self.video_concurrency, self.video_segmented, self.video_decode_threads, self.video_filter_threads):
+            widget.setEnabled(burn and not self.resources_locked)
+        if burn:
+            capacity = self.video_concurrency.maximum()
+            self.encoding_note.setText(f"当前设备最多 {capacity} 路。双卡自动分配最多6路，每卡最多3路；本地模型保留专用卡，CPU兼容编码限1路。\n视频与分段共用名额，内存按序合并，完整复制音轨并校验全部帧时间戳。\nMP4遇到无法保留的音轨或附件时，会在翻译开始前提示改用MKV。")
+        else:
+            self.encoding_note.setText("直接复制原视频和全部音轨，封装为MKV，保留原画质与音质。\n只保留一条新译文ASS字幕轨，默认显示，可在播放器中关闭；字体在资源与输出页选择。\n文件大小接近原片，不占编码槽。切换为烧录字幕后，可选择MP4/MKV及编码参数。")
 
     def accept(self):
         try:
@@ -608,6 +652,8 @@ class SettingsDialog(QDialog):
             s.llm_mode = self.llm_mode.currentData()
             s.local_model = self.local_model_editor.value()
             s.local_translate, s.local_review = self.local_translate.value(), self.local_review.value()
+            s.full_context_enabled = self.full_context_enabled.isChecked()
+            s.review_enabled = self.review_enabled.isChecked()
             if s.llm_mode == "local":
                 if not Path(s.local_model.model_path).is_file() or not Path(s.local_model.server_path).is_file():
                     raise ValueError("请先安装或选择 GGUF 文件与本地引擎程序，再保存本地模式")
@@ -617,7 +663,7 @@ class SettingsDialog(QDialog):
                 s.translate, s.translators = self.pool.values()
                 review_profile = s.translate if self.review.inherit.isChecked() else self.review.value()
                 if s.translation_profiles() and (not review_profile.url or not review_profile.model):
-                    raise ValueError("请为全片审校配置地址和模型，或让主翻译接口提供审校服务。文件名翻译也使用此接口。")
+                    raise ValueError("请为文件名翻译配置地址和模型，或继承主翻译接口；可选的上下文整理和审校也使用此接口。")
                 self.pool.save_keys()
                 self.review.save_key()
                 s.review = None if self.review.inherit.isChecked() else self.review.value()
@@ -625,6 +671,7 @@ class SettingsDialog(QDialog):
             s.ffmpeg, s.ffprobe = self.ffmpeg.text().strip(), self.ffprobe.text().strip()
             s.chunk_seconds, s.ram_gib, s.in_flight = self.chunk.value(), self.ram.value(), self.inflight.value()
             s.audio_stream, s.encoding = self.audio.value(), self.encode.currentData()
+            s.output_mode, s.output_container = self.output_mode.currentData(), self.output_container.currentData()
             s.video_codec, s.encoder_preset = self.codec.currentData(), self.encoder_speed.currentData()
             s.video_quality, s.size_mode = self.video_quality.value(), self.size_mode.currentData()
             s.video_bitrate_kbps = self.video_bitrate.value()
@@ -688,7 +735,7 @@ class MainWindow(QMainWindow):
         for text, code in (("高质量 · 默认", "quality"), ("均衡", "balanced"), ("快速", "fast")):
             self.preset.addItem(text,code)
         self.preset.setCurrentIndex(max(0,self.preset.findData(self.settings.preset)))
-        self.preset.setToolTip("高质量采用更细致的识别和更高画质；快速缩短处理时间。所有预设均进行全片审校。")
+        self.preset.setToolTip("调整Whisper识别搜索宽度：高质量5、均衡3、快速1。全片上下文整理与审校单独选择，默认关闭；软字幕保留原视频画质，烧录画质在字幕与视频页设置。")
         side.addWidget(self.preset)
         side.addWidget(label("识别语言", "muted"))
         self.source = language_combo(self.settings.source, True)
@@ -717,7 +764,7 @@ class MainWindow(QMainWindow):
         side.addWidget(button("模型与高级设置", self.open_settings))
         side.addStretch()
         side.addWidget(label("质量优先 · 内存音频缓存", "eyebrow"))
-        small = label("本地识别 → 即时翻译\n全片审校 → 字幕烧录\n完成即清理运行缓存", "muted")
+        small = label("本地识别 → 即时翻译\n可选审校 → 字幕导出\n完成即清理运行缓存", "muted")
         small.setStyleSheet("line-height:160%;")
         side.addWidget(small)
         side.addSpacing(10)
@@ -776,8 +823,11 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(button("＋ 添加视频", self.add_files))
         toolbar.addWidget(button("添加文件夹", self.add_folder))
         self.start_button = button("开始队列", self.start, True)
+        self.start_button.setToolTip("按当前设置启动排队任务并继续暂停任务；已运行和已完成的任务保留各自配置")
         toolbar.addWidget(self.start_button)
-        toolbar.addWidget(button("暂停", self.pause))
+        self.pause_button = button("暂停选中任务", self.pause)
+        self.pause_button.setToolTip("仅暂停选中的任务，支持 Ctrl / Shift 多选；如需暂停全部，请先 Ctrl+A 全选")
+        toolbar.addWidget(self.pause_button)
         body.addLayout(toolbar)
         splitter = QSplitter(Qt.Vertical)
         queue_area = QWidget()
@@ -786,10 +836,10 @@ class MainWindow(QMainWindow):
         self.queue = QTableWidget(0, 6)
         self.queue.setHorizontalHeaderLabels(["视频 / 输出", "状态", "阶段进度", "总 tokens / requests", "预计 / 实际大小", "详细信息"])
         self.queue.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
-        self.queue.setColumnWidth(0, 220)
+        self.queue.setColumnWidth(0, 200)
         self.queue.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.queue.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
-        self.queue.setColumnWidth(2, 135)
+        self.queue.setColumnWidth(2, 180)
         self.queue.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.queue.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.queue.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
@@ -801,7 +851,9 @@ class MainWindow(QMainWindow):
         self.queue.itemSelectionChanged.connect(self.show_preview)
         qv.addWidget(self.queue)
         actions = QHBoxLayout()
-        actions.addWidget(button("使用当前设置重试", self.retry))
+        self.retry_button = button("使用当前设置重试", self.retry)
+        self.retry_button.setToolTip("仅重试选中的任务，支持 Ctrl / Shift 多选；运行中的选中任务会先停止并保存恢复点，其他任务保持原计划")
+        actions.addWidget(self.retry_button)
         actions.addWidget(button("填写输出译名", self.manual_title))
         self.delete_button = button("删除选中任务", self.delete_selected)
         self.clear_button = button("清空全部任务", self.clear_tasks)
@@ -884,7 +936,7 @@ class MainWindow(QMainWindow):
                     self.store.add(str(p), s)
                     existing.add(str(p))
                     count += 1
-            self.status.setText(f"已添加 {count} 个任务 · 语言和输出参数已保存为各任务快照")
+            self.status.setText(f"已添加 {count} 个任务 · 点击开始队列时使用当前设置")
             self.refresh()
             if self.scheduler.accepting:
                 self.scheduler._pump()
@@ -914,25 +966,37 @@ class MainWindow(QMainWindow):
     def start(self):
         try:
             s = self.current_settings()
-            self.scheduler.configure(s)
-            s.save()
-            self.settings = s
-            self.scheduler.start()
-            self.status.setText("队列已启动 · 稳定字幕段产出后立即翻译，全部译完进行全片审校")
+            # A finishing worker can pump the next task in the background. Hold
+            # the scheduler lock until settings are saved and the queue is bound.
+            with self.scheduler.lock:
+                self.scheduler.configure(s)
+                s.save()
+                self.settings = s
+                self.scheduler.start()
+            self.status.setText("队列已按当前设置启动 · 空闲 GPU 预识别排队视频，前序任务开始编码或封装后释放翻译名额")
             self.refresh()
         except Exception as exc:
             QMessageBox.warning(self, "无法开始", str(exc))
 
     def pause(self):
-        self.scheduler.pause()
-        self.status.setText("正在暂停队列，保留文字恢复点；在途接口请求可能仍需等待返回")
+        rows = self.selected_rows()
+        if not rows:
+            self.status.setText("请先选择要暂停的任务，可使用 Ctrl / Shift 多选；Ctrl+A 全选后可暂停全部")
+            return
+        count = self.scheduler.pause([row["id"] for row in rows])
+        self.status.setText(f"正在暂停选中的 {count} 个任务并保存恢复点；其他任务保持原计划" if count else "选中任务已暂停或当前无需暂停")
+        self.refresh()
+
+    def selected_rows(self):
+        return [self.rows[index.row()] for index in sorted(self.queue.selectionModel().selectedRows(), key=lambda index: index.row())
+                if 0 <= index.row() < len(self.rows)]
 
     def selected(self):
         i = self.queue.currentRow()
         return self.rows[i] if 0 <= i < len(self.rows) else None
 
     def delete_selected(self):
-        ids = [self.rows[index.row()]["id"] for index in self.queue.selectionModel().selectedRows()]
+        ids = [row["id"] for row in self.selected_rows()]
         if not ids:
             self.status.setText("请先选择要删除的任务，可使用 Ctrl / Shift 多选")
             return
@@ -946,13 +1010,16 @@ class MainWindow(QMainWindow):
         self.refresh()
 
     def retry(self):
-        row = self.selected()
-        if row:
-            try:
-                self.scheduler.retry(row["id"], self.current_settings())
-                self.refresh()
-            except Exception as exc:
-                QMessageBox.warning(self, "无法重试", str(exc))
+        rows = self.selected_rows()
+        if not rows:
+            self.status.setText("请先选择要重试的任务，可使用 Ctrl / Shift 多选")
+            return
+        try:
+            count = self.scheduler.retry_many([row["id"] for row in rows], self.current_settings())
+            self.status.setText(f"已为选中的 {count} 个任务安排按当前设置重试；运行中的选中任务先停止并保存进度" if count else "选中任务已删除或正在删除，无法重试")
+            self.refresh()
+        except Exception as exc:
+            QMessageBox.warning(self, "无法重试", str(exc))
 
     def manual_title(self):
         row = self.selected()
@@ -977,7 +1044,7 @@ class MainWindow(QMainWindow):
                 self.show_preview()
             else:
                 self.preview.setRowCount(0)
-            self.status.setText("设置已保存 · 已有任务请使用当前设置重试；本地模式下网络 API 停用" if self.settings.llm_mode == "local" else "设置已保存 · 使用当前设置重试可更新已有任务")
+            self.status.setText("设置已保存 · 下次开始队列使用当前设置，运行中任务保持原配置" + ("；本地模式下网络 API 停用" if self.settings.llm_mode == "local" else ""))
             self.refresh()
 
     def install_model(self):
@@ -1070,9 +1137,15 @@ class MainWindow(QMainWindow):
             p = QProgressBar()
             p.setRange(0, 100)
             progress = self.progress.get(row["id"], {})
-            p.setValue(100 if row["state"].startswith("完成") else int(progress.get("progress", 0)*100))
-            inactive = row["state"] in ("等待处理", "已暂停", "等待恢复") or row["state"].startswith("完成")
-            p.setFormat(row["state"] if inactive else progress.get("stage", row["state"]))
+            prepared_wait = row["state"] == "排队中" and row["detail"].startswith("Whisper 已完成")
+            stage_progress = progress.get("stage_progress")
+            value = int((stage_progress if stage_progress is not None else progress.get("progress", 0))*100+1e-9)
+            p.setValue(100 if row["state"].startswith("完成") else 55 if prepared_wait else value)
+            inactive = row["state"] in ("等待处理", "暂停中", "已暂停", "等待恢复") or row["state"].startswith("完成")
+            stage = progress.get("stage", row["state"])
+            if stage_progress is not None:
+                stage += f" {value}/100%"
+            p.setFormat(row["state"] if inactive else "等待翻译名额" if prepared_wait else stage)
             p.setToolTip(row["detail"])
             p.setFixedHeight(22)
             progress_cell = QWidget()
@@ -1089,12 +1162,13 @@ class MainWindow(QMainWindow):
             metadata = self.media_info.get(row["id"])
             size_item = QTableWidgetItem("读取中…")
             if metadata and "info" in metadata:
-                completed = row["state"].startswith("完成")
-                size_settings = Settings.from_dict(json.loads(row["config"])) if completed else estimate_settings
+                frozen = row["id"] in self.scheduler.active or row["state"].startswith("完成")
+                size_settings = Settings.from_dict(json.loads(row["config"])) if frozen else estimate_settings
                 estimate = estimate_output(metadata["info"], size_settings)
                 size_item.setText("约 " + file_size(estimate["bytes"]))
-                basis = "任务保存的设置" if completed else "当前设置"
-                size_item.setToolTip(f"{basis}估算：{file_size(estimate['low'])}–{file_size(estimate['high'])}；实际大小受画面复杂度影响。已有任务按保存的配置执行，使用当前设置重试可更新。")
+                basis = "任务启动时的设置" if frozen else "当前设置"
+                explanation = "软字幕直接复制原视频和音轨，大小接近原片，因字幕和封装开销略有变化" if size_settings.output_mode == "soft" else "实际大小受画面复杂度影响"
+                size_item.setToolTip(f"{basis}估算：{file_size(estimate['low'])}–{file_size(estimate['high'])}；{explanation}。开始队列时使用当前设置；运行中和已完成的任务保留启动配置。")
             elif metadata:
                 size_item.setText("无法估算")
                 size_item.setToolTip(metadata["error"])

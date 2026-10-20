@@ -45,7 +45,7 @@ class Store:
         # Existing tasks predate persistent usage collection. Never invent their totals.
         self.db.execute("INSERT OR IGNORE INTO usage(job,partial,requests_partial) SELECT id,1,1 FROM jobs")
         self.db.execute("INSERT OR IGNORE INTO api_status(job,state,code,message,partial) SELECT id,'paused',429,'旧版记录HTTP 429；历史限流次数未记录',1 FROM jobs WHERE detail LIKE '%HTTP 429%'")
-        self.db.execute("UPDATE jobs SET state='等待恢复', detail='应用已退出，可继续未完成阶段' WHERE state IN ('处理中','排队中')")
+        self.db.execute("UPDATE jobs SET state='等待恢复', detail='应用已退出，可继续未完成阶段' WHERE state IN ('处理中','排队中','暂停中')")
         self.db.commit()
 
     def add(self, source, settings):

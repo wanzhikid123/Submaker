@@ -82,6 +82,8 @@ class Settings:
     ffmpeg: str = shutil.which("ffmpeg") or "ffmpeg"
     ffprobe: str = shutil.which("ffprobe") or "ffprobe"
     output_dir: str = ""
+    output_mode: str = "soft"
+    output_container: str = "mkv"
     encoding: str = "hardware"
     decoding: str = "hardware"
     video_gpu: int = -1
@@ -104,6 +106,8 @@ class Settings:
     translate: Profile = dataclasses.field(default_factory=Profile)
     translators: list[Profile] = dataclasses.field(default_factory=list)
     review: Profile | None = None
+    full_context_enabled: bool = False
+    review_enabled: bool = False
     repair_via_review: bool = True
     llm_mode: str = "api"
     local_model: LocalModel = dataclasses.field(default_factory=LocalModel)
@@ -138,6 +142,11 @@ class Settings:
             return VIDEO_ENCODERS_PER_GPU
         devices = [self.video_gpu] if self.video_gpu >= 0 else self.gpus
         return min(MAX_VIDEO_ENCODERS, max(1, len(set(devices))*VIDEO_ENCODERS_PER_GPU))
+
+    def output_extension(self):
+        if self.output_mode not in ("soft", "burn") or self.output_container not in ("mkv", "mp4"):
+            raise ValueError("请选择软字幕封装或烧录字幕，烧录容器请选择 MKV / MP4")
+        return "mkv" if self.output_mode == "soft" else self.output_container
 
     def encoding_limit(self):
         if not 1 <= self.video_concurrency <= MAX_VIDEO_ENCODERS:
@@ -187,6 +196,11 @@ class Settings:
                 d[key] = LocalRole(**{k: v for k, v in d[key].items() if k in {f.name for f in dataclasses.fields(LocalRole)}})
         # Existing task snapshots retain their original repair route and cache policy.
         d.setdefault("repair_via_review", False)
+        d.setdefault("output_mode", "burn")
+        # A running/resumed legacy snapshot keeps its original enabled stages.
+        # Global settings and newly started queues use the new opt-in defaults.
+        d.setdefault("full_context_enabled", True)
+        d.setdefault("review_enabled", True)
         return cls(**d)
 
     @classmethod
@@ -196,6 +210,11 @@ class Settings:
             return cls()
         value = json.loads(path.read_text(encoding="utf-8"))
         value.setdefault("repair_via_review", True)
+        value.setdefault("full_context_enabled", False)
+        value.setdefault("review_enabled", False)
+        # Global defaults migrate to soft subtitles; existing task snapshots
+        # without output_mode continue to burn through from_dict().
+        value.setdefault("output_mode", "soft")
         if "video_concurrency" not in value and value.get("in_flight", 3) == 3:
             value["in_flight"] = 4
         return cls.from_dict(value)

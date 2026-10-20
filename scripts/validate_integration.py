@@ -80,7 +80,7 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix="integration-",dir=build) as temp:
             temporary=Path(temp)
-            settings=Settings(output_dir=str(output),chunk_seconds=120)
+            settings=Settings(output_dir=str(output),chunk_seconds=120,full_context_enabled=True,review_enabled=True)
             settings.translate.url=f"http://127.0.0.1:{server.server_port}/v1"
             settings.translate.model="local-mock-validation"
             settings.translate.key_id="validation-no-key"

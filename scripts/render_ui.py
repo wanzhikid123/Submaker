@@ -43,7 +43,7 @@ with tempfile.TemporaryDirectory() as temporary:
     finished = root/"晨光.mkv"
     with finished.open("wb") as stream:
         stream.truncate(492*1024**2)
-    store.update(jobs[2], "完成", "一次审校与自动修订完成；运行缓存已清理", finished)
+    store.update(jobs[2], "完成", "翻译完成；未启用全片上下文整理与审校；运行缓存已清理", finished)
     store.add_usage(jobs[2], {"prompt_tokens": 22150, "completion_tokens": 11840, "total_tokens": 33990})
     with store.db:
         for ident, count in zip(jobs, (42, 31, 27)):

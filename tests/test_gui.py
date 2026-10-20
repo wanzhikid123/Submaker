@@ -134,9 +134,31 @@ def test_gpu_ring_renders_threshold_colors_and_handles_missing_samples():
         ring.close()
 
 
+def test_soft_output_defaults_and_burn_container_controls(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(Settings, "save", lambda self: None)
+    dialog = SettingsDialog(Settings())
+    try:
+        assert dialog.output_mode.currentData() == "soft"
+        assert not dialog.codec.isEnabled() and not dialog.video_segmented.isEnabled()
+        assert not dialog.output_container.isEnabled() and "MKV" in dialog.encoding_note.text()
+        dialog.output_mode.setCurrentIndex(dialog.output_mode.findData("burn"))
+        assert dialog.codec.isEnabled() and dialog.video_segmented.isEnabled()
+        assert dialog.output_container.isEnabled()
+        dialog.output_container.setCurrentIndex(dialog.output_container.findData("mp4"))
+        dialog.output_mode.setCurrentIndex(dialog.output_mode.findData("soft"))
+        assert not dialog.output_container.isEnabled()
+        dialog.output_mode.setCurrentIndex(dialog.output_mode.findData("burn"))
+        assert dialog.output_container.currentData() == "mp4"
+        dialog.accept()
+        assert dialog.settings.output_mode == "burn" and dialog.settings.output_extension() == "mp4"
+    finally:
+        dialog.close()
+
+
 def test_encoding_ui_tracks_dual_gpu_local_fixed_gpu_and_cpu_capacity():
     app = QApplication.instance() or QApplication([])
-    dialog = SettingsDialog(Settings())
+    dialog = SettingsDialog(Settings(output_mode="burn"))
     try:
         assert dialog.video_concurrency.maximum() == dialog.video_concurrency.value() == 6
         dialog.llm_mode.setCurrentIndex(dialog.llm_mode.findData("local"))

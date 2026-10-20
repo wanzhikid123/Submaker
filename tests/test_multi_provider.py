@@ -299,6 +299,8 @@ def test_pipeline_keeps_completed_single_provider_units_when_pool_is_added(tmp_p
     (model/"model.bin").touch()
     settings = settings_pair()
     settings.repair_via_review = repair_via_review
+    settings.full_context_enabled = settings.review_enabled = True
+    settings.output_mode = "burn"  # This fixture stubs the burn exporter, not real media.
     settings.review = Profile(name="Reviewer", url="http://localhost/review", model="review", effort="high", enabled=False, rpm=0, key_id="review-key")
     second = settings.translators.pop()
     settings.model_path, settings.output_dir = str(model), str(tmp_path/"out")

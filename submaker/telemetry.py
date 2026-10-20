@@ -144,7 +144,8 @@ def provider_detail_lines(row, activity=(), quotas=(), queued=0, now=None):
     current = {profile_tag(p) for p, _ in profiles}
     review = settings.review_profile()
     if review.url and review.model and profile_tag(review) not in current:
-        profiles.append((review, review.name+"（全片审校）"))
+        role = "全片审校" if settings.review_enabled else "全片上下文 / 文件名" if settings.full_context_enabled else "文件名"
+        profiles.append((review, review.name+"（"+role+"）"))
         current.add(profile_tag(review))
     records = {p["profile"]: p for p in row.get("api_providers", [])}
     lines = []
